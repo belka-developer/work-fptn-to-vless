@@ -1,0 +1,2256 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4d414b3..a8f7716 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -170,6 +170,10 @@ if (NOT FPTN_BUILD_ONLY_FPTN_LIB)
+         add_subdirectory(src/fptn-passwd)
+     endif ()
+     add_subdirectory(src/fptn-client)
++    option(FPTN_BUILD_VLESS "Build fptn-vless (userspace client with a VLESS inbound)" ON)
++    if (FPTN_BUILD_VLESS)
++        add_subdirectory(src/fptn-vless)
++    endif ()
+     if (FPTN_OPENWRT)
+         add_subdirectory(deploy/openwrt/fptn-tcp-probe)
+     endif ()
+diff --git a/src/common/network/net_interface.h b/src/common/network/net_interface.h
+index a4f1e7c..28bc281 100644
+--- a/src/common/network/net_interface.h
++++ b/src/common/network/net_interface.h
+@@ -357,7 +357,9 @@ class GenericTunInterface final
+ 
+ }  // namespace fptn::common::network
+ // Platform-specific TUN device includes (outside namespace to avoid nesting)
+-#if defined(__APPLE__)
++#if defined(FPTN_USERSPACE_TUN)
++#include "fptn-vless/userspace_tun_device.h"
++#elif defined(__APPLE__)
+ #include "common/network/tun/darwin_tun_device.h"
+ 
+ #elif defined(__linux__)
+@@ -368,7 +370,9 @@ class GenericTunInterface final
+ 
+ namespace fptn::common::network {
+ // Platform-specific TUN interface aliases
+-#if defined(__APPLE__)
++#if defined(FPTN_USERSPACE_TUN)
++using TunInterface = GenericTunInterface<UserspaceTunDevice>;
++#elif defined(__APPLE__)
+ using TunInterface = GenericTunInterface<DarwinTunDevice>;
+ #elif defined(__linux__)
+ using TunInterface = GenericTunInterface<LinuxTunDevice>;
+diff --git a/src/fptn-client/vpn/vpn_manager.cpp b/src/fptn-client/vpn/vpn_manager.cpp
+index 8501a9a..a5b7259 100644
+--- a/src/fptn-client/vpn/vpn_manager.cpp
++++ b/src/fptn-client/vpn/vpn_manager.cpp
+@@ -372,7 +372,9 @@ void VpnManager::Supervise() {
+     if (full_restart_count >= kMaxFullRestarts_) {
+       SPDLOG_ERROR("VPN reconnection failed after {} full restarts. Giving up.",
+           kMaxFullRestarts_);
+-      config_.route_manager->Clean();
++      if (config_.route_manager) {
++        config_.route_manager->Clean();
++      }
+       reconnecting_ = false;
+       gave_up_ = true;
+       break;
+@@ -392,7 +394,9 @@ void VpnManager::Supervise() {
+ 
+     // Unlocked: the route manager guards itself, and holding mutex_ across
+     // seconds of netsh/powershell freezes both packet paths.
+-    config_.route_manager->Clean();
++    if (config_.route_manager) {
++      config_.route_manager->Clean();
++    }
+ 
+     {
+       std::unique_lock<std::mutex> lock(reconnect_mutex_);
+@@ -403,7 +407,9 @@ void VpnManager::Supervise() {
+       break;
+     }
+ 
+-    config_.route_manager->Apply(tun_name);
++    if (config_.route_manager) {
++      config_.route_manager->Apply(tun_name);
++    }
+ 
+     {
+       const std::unique_lock<std::mutex> lock(mutex_);  // mutex
+diff --git a/src/fptn-vless/CMakeLists.txt b/src/fptn-vless/CMakeLists.txt
+new file mode 100644
+index 0000000..7d9cae9
+--- /dev/null
++++ b/src/fptn-vless/CMakeLists.txt
+@@ -0,0 +1,153 @@
++project(fptn-vless)
++
++include(FetchContent)
++
++# ---------------------------------------------------------------------------
++# lwIP: userspace TCP/IP stack. Pinned to the release the tests were run with.
++# ---------------------------------------------------------------------------
++FetchContent_Declare(
++  lwip
++  GIT_REPOSITORY https://github.com/lwip-tcpip/lwip.git
++  GIT_TAG STABLE-2_2_1_RELEASE
++  GIT_SHALLOW TRUE)
++FetchContent_GetProperties(lwip)
++if(NOT lwip_POPULATED)
++  FetchContent_Populate(lwip)
++endif()
++set(LWIP_DIR "${lwip_SOURCE_DIR}")
++
++add_library(
++  fptn_lwip STATIC
++  ${LWIP_DIR}/src/core/init.c
++  ${LWIP_DIR}/src/core/def.c
++  ${LWIP_DIR}/src/core/dns.c
++  ${LWIP_DIR}/src/core/inet_chksum.c
++  ${LWIP_DIR}/src/core/ip.c
++  ${LWIP_DIR}/src/core/mem.c
++  ${LWIP_DIR}/src/core/memp.c
++  ${LWIP_DIR}/src/core/netif.c
++  ${LWIP_DIR}/src/core/pbuf.c
++  ${LWIP_DIR}/src/core/raw.c
++  ${LWIP_DIR}/src/core/stats.c
++  ${LWIP_DIR}/src/core/sys.c
++  ${LWIP_DIR}/src/core/tcp.c
++  ${LWIP_DIR}/src/core/tcp_in.c
++  ${LWIP_DIR}/src/core/tcp_out.c
++  ${LWIP_DIR}/src/core/timeouts.c
++  ${LWIP_DIR}/src/core/udp.c
++  ${LWIP_DIR}/src/core/ipv4/icmp.c
++  ${LWIP_DIR}/src/core/ipv4/ip4.c
++  ${LWIP_DIR}/src/core/ipv4/ip4_addr.c
++  ${LWIP_DIR}/src/core/ipv4/ip4_frag.c)
++target_include_directories(
++  fptn_lwip PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/lwip_port"
++                   "${LWIP_DIR}/src/include")
++# The root project builds with -Werror/-pedantic or /WX; third-party C code is
++# not subject to that.
++set_target_properties(fptn_lwip PROPERTIES COMPILE_WARNING_AS_ERROR OFF)
++if(MSVC)
++  target_compile_options(fptn_lwip PRIVATE /W0 /WX-)
++else()
++  target_compile_options(fptn_lwip PRIVATE -w -Wno-error)
++endif()
++
++# ---------------------------------------------------------------------------
++# fptn-vless
++#
++# FPTN_USERSPACE_TUN swaps the TunInterface type (see net_interface.h), so every
++# translation unit that sees VpnManager::Config must be compiled WITH it. That
++# is why vpn_manager.cpp & friends are compiled again here instead of being
++# linked from fptn-client-cli (mixing the two would be an ODR violation).
++# ---------------------------------------------------------------------------
++set(FPTN_CLIENT_DIR "${CMAKE_SOURCE_DIR}/src/fptn-client")
++
++find_package(OpenSSL REQUIRED)
++find_package(argparse REQUIRED)
++find_package(spdlog REQUIRED)
++find_package(fmt REQUIRED)
++find_package(Boost REQUIRED COMPONENTS random filesystem process locale)
++find_package(ZLIB REQUIRED)
++find_package(httplib REQUIRED)
++find_package(libidn2 REQUIRED)
++find_package(re2 REQUIRED)
++find_package(nlohmann_json REQUIRED)
++find_package(brotli REQUIRED)
++find_path(BROTLI_INCLUDE_DIR "brotli/decode.h" REQUIRED)
++find_library(BROTLI_DEC_LIB NAMES brotlidec REQUIRED)
++find_library(BROTLI_COMMON_LIB NAMES brotlicommon REQUIRED)
++find_library(BROTLI_ENC_LIB NAMES brotlienc REQUIRED)
++
++add_executable(
++  "${PROJECT_NAME}"
++  fptn-vless.cpp
++  userspace_stack.cpp
++  userspace_stack.h
++  userspace_tun_device.h
++  vless_server.cpp
++  vless_server.h
++  # shared with fptn-client-cli, recompiled with FPTN_USERSPACE_TUN
++  "${FPTN_CLIENT_DIR}/vpn/vpn_manager.cpp"
++  "${FPTN_CLIENT_DIR}/vpn/http/client.cpp"
++  "${FPTN_CLIENT_DIR}/routing/route_manager.cpp"
++  "${FPTN_CLIENT_DIR}/config/config_file.cpp"
++  "${FPTN_CLIENT_DIR}/plugins/split/tunneling.cpp"
++  "${FPTN_CLIENT_DIR}/utils/speed_estimator/speed_estimator.cpp")
++
++target_compile_definitions("${PROJECT_NAME}" PRIVATE FPTN_USERSPACE_TUN=1)
++if(MSVC)
++  # This code was only checked with GCC/MinGW. Do not let an MSVC-only
++  # warning stop the build (the root project forces /WX).
++  set_target_properties("${PROJECT_NAME}" PROPERTIES COMPILE_WARNING_AS_ERROR
++                                                     OFF)
++  target_compile_options("${PROJECT_NAME}" PRIVATE /WX-)
++endif()
++# fptn-client sources include each other relative to src/fptn-client
++target_include_directories("${PROJECT_NAME}" PRIVATE "${FPTN_CLIENT_DIR}"
++                                                     "${BROTLI_INCLUDE_DIR}")
++
++if(WIN32)
++  # no Wintun here on purpose: this program never creates an adapter
++  set(PLATFORM_LIBS rpcrt4 iphlpapi Kernel32.lib ws2_32)
++else()
++  set(PLATFORM_LIBS "")
++endif()
++
++target_link_libraries(
++  "${PROJECT_NAME}"
++  PRIVATE fptn_lwip
++          ZLIB::ZLIB
++          Boost::boost
++          Boost::random
++          Boost::filesystem
++          Boost::process
++          Boost::locale
++          OpenSSL::SSL
++          OpenSSL::Crypto
++          argparse::argparse
++          nlohmann_json::nlohmann_json
++          spdlog::spdlog
++          fmt::fmt
++          libidn2::libidn2
++          re2::re2
++          fptn-protocol-lib_static
++          "${BROTLI_DEC_LIB}"
++          "${BROTLI_COMMON_LIB}"
++          ${PLATFORM_LIBS})
++
++install(TARGETS "${PROJECT_NAME}" DESTINATION bin)
++
++# --- tests (no FPTN server needed) -----------------------------------------
++option(FPTN_VLESS_BUILD_TESTS "Build the fptn-vless loopback test" ON)
++if(FPTN_VLESS_BUILD_TESTS AND UNIX)
++  add_executable(fptn_vless_echo_peer test/echo_peer.cpp)
++  target_link_libraries(fptn_vless_echo_peer PRIVATE fptn_lwip)
++
++  add_executable(fptn_vless_loopback_test test/loopback_test.cpp
++                                          userspace_stack.cpp vless_server.cpp)
++  target_link_libraries(
++    fptn_vless_loopback_test PRIVATE fptn_lwip spdlog::spdlog fmt::fmt
++                                     Boost::boost)
++  add_test(NAME fptn_vless_loopback
++           COMMAND fptn_vless_loopback_test
++           WORKING_DIRECTORY $<TARGET_FILE_DIR:fptn_vless_echo_peer>)
++endif()
+diff --git a/src/fptn-vless/README.md b/src/fptn-vless/README.md
+new file mode 100644
+index 0000000..902e952
+--- /dev/null
++++ b/src/fptn-vless/README.md
+@@ -0,0 +1,56 @@
++# fptn-vless
++
++Консольная утилита: подключается к FPTN по токену и отдаёт туннель в локальную
++сеть как **VLESS-inbound**. На ПК не создаётся адаптер, не меняются маршруты и
++DNS: туннель заканчивается в userspace-стеке (lwIP). Закрыли окно, и система
++осталась как была.
++
++```
++LAN-клиент --VLESS--> fptn-vless.exe --[lwIP]--> libfptn --TLS--> FPTN-сервер
++```
++
++## Использование
++
++```
++fptn-vless.exe --access-token <токен>
++fptn-vless.exe --access-token <токен> --server 2 --port 10800
++```
++
++Без `--server` программа покажет серверы из токена и спросит номер
++(Enter = автоматически, самый быстрый). После подключения печатает ссылку:
++
++```
++vless://<uuid>@<IP-этого-ПК>:10800?encryption=none&security=none&type=tcp#fptn-<сервер>
++```
++
++UUID получается из токена, то есть он стабилен между запусками (или задайте `--uuid`).
++
++| Опция | По умолчанию |
++|---|---|
++| `--listen` | `0.0.0.0` |
++| `--port` | `10800` |
++| `--bypass-method` | `sni-spoofing-yandex-26-4` |
++| `--connection-strategy` | `rolling-tunnel` |
++| `--sni`, `--mtu-size`, `--uuid` | как в `fptn-client-cli` |
++
++## Что изменено в upstream (всего +19/−5 строк)
++
++* `common/network/net_interface.h`: при `FPTN_USERSPACE_TUN` вместо Wintun/Linux TUN
++  используется `UserspaceTunDevice`.
++* `fptn-client/vpn/vpn_manager.cpp`: `route_manager` стал необязательным (nullptr).
++* `CMakeLists.txt`: подключён `src/fptn-vless`.
++
++Остальное (`src/fptn-vless/`) добавлено, существующий код не переписан.
++
++## Ограничения
++
++* Только TCP. VLESS-UDP (QUIC/HTTP3 с клиентов) не поддержан, приложения откатятся на TCP.
++* Только IPv4 цели. Домены резолвятся внутри туннеля через DNS сервера FPTN.
++* VLESS без TLS: только для доверенной LAN. Не пробрасывайте порт наружу.
++* Брандмауэр Windows спросит разрешение на входящие: разрешите для частных сетей.
++
++## Тесты
++
++`fptn_vless_loopback_test` проверяет весь путь VLESS -> lwIP -> IP-пакеты -> второй
++lwIP без настоящего FPTN-сервера: эхо, 4 МиБ вниз/вверх с проверкой данных,
++8 параллельных потоков, неверный UUID, таймаут, закрытый порт.
+diff --git a/src/fptn-vless/fptn-vless.cpp b/src/fptn-vless/fptn-vless.cpp
+new file mode 100644
+index 0000000..d69c6b5
+--- /dev/null
++++ b/src/fptn-vless/fptn-vless.cpp
+@@ -0,0 +1,346 @@
++/*
++ * fptn-vless: connect to an FPTN server with an access token and expose the
++ * tunnel to the LAN as a plain VLESS inbound.
++ *
++ * Unlike fptn-client-cli this program never creates a network adapter and
++ * never touches routes or DNS: the tunnel terminates in a userspace TCP/IP
++ * stack (lwIP). Closing it - cleanly or not - leaves Windows exactly as it was.
++ */
++
++#include <algorithm>
++#include <cctype>
++#include <functional>
++#include <iostream>
++#include <map>
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include <argparse/argparse.hpp>
++#include <boost/asio.hpp>
++#include <fmt/format.h>  // NOLINT(build/include_order)
++#include <openssl/sha.h>
++
++#include "common/logger/logger.h"
++#include "common/network/ip_address.h"
++#include "common/network/net_interface.h"
++
++#include "config/config_file.h"
++#include "fptn-protocol-lib/https/censorship_strategy.h"
++#include "fptn-protocol-lib/time/time_provider.h"
++#include "routing/route_manager.h"  // ResolveDomain only
++#include "vpn/vpn_manager.h"
++
++#include "fptn-vless/userspace_stack.h"
++#include "fptn-vless/vless_server.h"
++
++namespace {
++
++using fptn::protocol::https::CensorshipStrategy;
++using fptn::protocol::connection::strategies::ConnectionStrategy;
++
++const std::map<std::string, CensorshipStrategy>& BypassMethods() {
++  static const std::map<std::string, CensorshipStrategy> kMethods = {
++      {"obfuscation", CensorshipStrategy::kTlsObfuscator},
++      {"sni-spoofing-chrome-149", CensorshipStrategy::kSniRealityModeChrome149},
++      {"sni-spoofing-chrome-148", CensorshipStrategy::kSniRealityModeChrome148},
++      {"sni-spoofing-chrome-147", CensorshipStrategy::kSniRealityModeChrome147},
++      {"sni-spoofing-chrome-146", CensorshipStrategy::kSniRealityModeChrome146},
++      {"sni-spoofing-chrome-145", CensorshipStrategy::kSniRealityModeChrome145},
++      {"sni-spoofing-firefox-151",
++          CensorshipStrategy::kSniRealityModeFirefox151},
++      {"sni-spoofing-firefox-150",
++          CensorshipStrategy::kSniRealityModeFirefox150},
++      {"sni-spoofing-firefox-149",
++          CensorshipStrategy::kSniRealityModeFirefox149},
++      {"sni-spoofing-yandex-26-4", CensorshipStrategy::kSniRealityModeYandex26_4},
++      {"sni-spoofing-yandex-26-3", CensorshipStrategy::kSniRealityModeYandex26_3},
++      {"sni-spoofing-yandex-25", CensorshipStrategy::kSniRealityModeYandex25},
++      {"sni-spoofing-yandex-24", CensorshipStrategy::kSniRealityModeYandex24},
++      {"sni-spoofing-safari-26-5", CensorshipStrategy::kSniRealityModeSafari26_5},
++      {"sni-spoofing-safari-26-4", CensorshipStrategy::kSniRealityModeSafari26_4},
++  };
++  return kMethods;
++}
++
++const std::map<std::string, ConnectionStrategy>& ConnectionStrategies() {
++  static const std::map<std::string, ConnectionStrategy> kStrategies = {
++      {"rolling-tunnel", ConnectionStrategy::kSingleRollingTunnel},
++      {"dual-rolling-tunnel", ConnectionStrategy::kDualRollingTunnel},
++      {"triple-rolling-tunnel", ConnectionStrategy::kTripleRollingTunnel},
++  };
++  return kStrategies;
++}
++
++// Same token -> same UUID, so the client profile on your phone/PC survives
++// restarts without storing anything on disk. Override with --uuid.
++fptn::vless::Uuid DeriveUuid(const std::string& token) {
++  unsigned char digest[SHA256_DIGEST_LENGTH];
++  SHA256(reinterpret_cast<const unsigned char*>(token.data()), token.size(),
++      digest);
++  fptn::vless::Uuid uuid{};
++  std::copy(digest, digest + 16, uuid.begin());
++  uuid[6] = (uuid[6] & 0x0F) | 0x50;
++  uuid[8] = (uuid[8] & 0x3F) | 0x80;
++  return uuid;
++}
++
++bool IsNumber(const std::string& s) {
++  return !s.empty() && std::all_of(s.begin(), s.end(), [](unsigned char c) {
++    return std::isdigit(c) != 0;
++  });
++}
++
++}  // namespace
++
++int main(int argc, char* argv[]) {
++  argparse::ArgumentParser args("fptn-vless", FPTN_VERSION);
++  args.add_argument("--access-token").required().help("FPTN access token");
++  args.add_argument("--server")
++      .default_value("")
++      .help(
++          "Server name or its number from the list. Empty: show the list and "
++          "ask (Enter = pick automatically)");
++  args.add_argument("--listen")
++      .default_value("0.0.0.0")
++      .help("Address of the VLESS inbound (0.0.0.0 = whole LAN)");
++  args.add_argument("--port").default_value(10800).scan<'i', int>().help(
++      "Port of the VLESS inbound");
++  args.add_argument("--uuid")
++      .default_value("")
++      .help("VLESS user id. Empty: derived from the access token");
++  args.add_argument("--sni").default_value(FPTN_DEFAULT_SNI).help("TLS SNI");
++  args.add_argument("--bypass-method")
++      .default_value("sni-spoofing-yandex-26-4")
++      .help("Same values as fptn-client-cli --bypass-method");
++  args.add_argument("--connection-strategy")
++      .default_value("rolling-tunnel")
++      .help("rolling-tunnel | dual-rolling-tunnel | triple-rolling-tunnel");
++  args.add_argument("--mtu-size").default_value(FPTN_DEFAULT_MTU_SIZE)
++      .scan<'i', int>().help("MTU of the userspace stack");
++
++  try {
++    args.parse_args(argc, argv);
++  } catch (const std::exception& err) {
++    std::cerr << err.what() << std::endl << args;
++    return EXIT_FAILURE;
++  }
++
++  if (!fptn::logger::init("fptn-vless")) {
++    std::cerr << "File logging unavailable, logging to console only\n";
++  }
++  SPDLOG_INFO("fptn-vless {} started", FPTN_VERSION);
++  fptn::time::TimeProvider::Instance();
++
++  try {
++    /* ---- options ---- */
++    const auto sni = args.get<std::string>("--sni");
++    const auto bypass_name = args.get<std::string>("--bypass-method");
++    const auto strategy_name = args.get<std::string>("--connection-strategy");
++    const auto bypass_it = BypassMethods().find(bypass_name);
++    const auto strategy_it = ConnectionStrategies().find(strategy_name);
++    if (bypass_it == BypassMethods().end()) {
++      SPDLOG_ERROR("Unknown --bypass-method '{}'", bypass_name);
++      return EXIT_FAILURE;
++    }
++    if (strategy_it == ConnectionStrategies().end()) {
++      SPDLOG_ERROR("Unknown --connection-strategy '{}'", strategy_name);
++      return EXIT_FAILURE;
++    }
++    const int mtu_size = args.get<int>("--mtu-size");
++    const int port = args.get<int>("--port");
++    if (port < 1 || port > 65535 || mtu_size < 576 || mtu_size > 65535) {
++      SPDLOG_ERROR("--port or --mtu-size is out of range");
++      return EXIT_FAILURE;
++    }
++    const auto access_token = args.get<std::string>("--access-token");
++    fptn::vless::Uuid uuid = DeriveUuid(access_token);
++    if (const auto text = args.get<std::string>("--uuid"); !text.empty()) {
++      if (!fptn::vless::ParseUuid(text, uuid)) {
++        SPDLOG_ERROR("--uuid is not a valid UUID");
++        return EXIT_FAILURE;
++      }
++    }
++
++    /* ---- token -> server list -> choice ---- */
++    fptn::config::ConfigFile config(access_token, sni, bypass_it->second);
++    config.Parse();
++    const auto& servers = config.GetServers();
++    if (servers.empty()) {
++      SPDLOG_ERROR("The token contains no servers");
++      return EXIT_FAILURE;
++    }
++
++    std::string choice = args.get<std::string>("--server");
++    if (choice.empty()) {
++      std::cout << "\nServers in this token:\n";
++      for (std::size_t i = 0; i < servers.size(); ++i) {
++        std::cout << fmt::format("  {:>2}. {}  ({}:{})\n", i + 1,
++            servers[i].name, servers[i].host, servers[i].port);
++      }
++      std::cout << "Select server number or name [Enter = automatic]: "
++                << std::flush;
++      std::getline(std::cin, choice);
++    }
++    if (IsNumber(choice)) {
++      const auto index = static_cast<std::size_t>(std::stoul(choice));
++      if (index < 1 || index > servers.size()) {
++        SPDLOG_ERROR("No server number {}", index);
++        return EXIT_FAILURE;
++      }
++      choice = servers[index - 1].name;
++    }
++
++    fptn::utils::speed_estimator::ServerInfo selected_server;
++    std::string pre_obtained_token;
++    if (!choice.empty()) {
++      auto server = config.GetServer(choice);
++      if (!server.has_value()) {
++        SPDLOG_ERROR("Server '{}' does not exist in the token", choice);
++        return EXIT_FAILURE;
++      }
++      selected_server = std::move(*server);
++    } else {
++      auto login_result = config.FindServerByLogin(10);
++      if (!login_result) {
++        SPDLOG_ERROR("All servers unavailable!");
++        return EXIT_FAILURE;
++      }
++      selected_server = login_result->server;
++      pre_obtained_token = std::move(login_result->access_token);
++    }
++
++    const auto server_ip = fptn::routing::ResolveDomain(selected_server.host);
++    if (server_ip.IsEmpty()) {
++      SPDLOG_ERROR("DNS resolve error: {}", selected_server.host);
++      return EXIT_FAILURE;
++    }
++
++    /* ---- login (identical to fptn-client-cli) ---- */
++    const auto tun_ipv4 = fptn::common::network::IPv4Address::Create(
++        FPTN_CLIENT_DEFAULT_ADDRESS_IP4);
++    const auto tun_ipv6 = fptn::common::network::IPv6Address::Create(
++        FPTN_CLIENT_DEFAULT_ADDRESS_IP6);
++
++    auto http_client = std::make_unique<fptn::vpn::http::Client>(
++        fptn::protocol::https::ConnectionConfig{
++            .common ={
++                    .server_ip = server_ip,
++                    .server_port =
++                        static_cast<std::uint16_t>(selected_server.port),
++                    .sni = sni,
++                    .md5_fingerprint = selected_server.md5_fingerprint,
++                    .client_version = FPTN_VERSION,
++                    .censorship_strategy = bypass_it->second,
++                    .tun_interface_address_ipv4 = tun_ipv4,
++                    .tun_interface_address_ipv6 = tun_ipv6,
++                }},
++        strategy_it->second);
++    if (!pre_obtained_token.empty()) {
++      http_client->SetAccessToken(pre_obtained_token);
++    }
++    if (!http_client->Login(config.GetUsername(), config.GetPassword())) {
++      SPDLOG_ERROR("Login failed (code {}): {}", http_client->LatestErrorCode(),
++          http_client->LatestError());
++      return EXIT_FAILURE;
++    }
++    const auto [dns_ipv4, dns_ipv6] = http_client->GetDns();
++    if (dns_ipv4.IsEmpty()) {
++      SPDLOG_ERROR("The server did not provide a DNS address");
++      return EXIT_FAILURE;
++    }
++
++    /* ---- userspace stack instead of an OS adapter ---- */
++    auto& stack = fptn::vless::UserspaceStack::Instance();
++    fptn::vless::UserspaceStack::Config stack_config;
++    stack_config.ipv4 = tun_ipv4.ToString();
++    stack_config.dns_ipv4 = dns_ipv4.ToString();
++    stack_config.mtu = mtu_size;
++    if (!stack.Start(stack_config)) {
++      SPDLOG_ERROR("Cannot start the userspace network stack");
++      return EXIT_FAILURE;
++    }
++
++    auto virtual_network_interface =
++        std::make_shared<fptn::common::network::TunInterface>(
++            fptn::common::network::TunInterface::Config{
++                .name = "fptn-userspace",
++                .mtu_size = mtu_size,
++                .using_rate_calculator = false,
++                .ipv4_addr = tun_ipv4,
++                .ipv4_netmask = 32,
++                .ipv6_addr = tun_ipv6,
++                .ipv6_netmask = 126});
++
++    // No route manager, no plugins: nothing is changed on this machine.
++    fptn::vpn::VpnManager vpn_client(
++        fptn::vpn::VpnManager::Config{.http_client = std::move(http_client),
++            .route_manager = nullptr,
++            .virtual_net_interface = virtual_network_interface,
++            .plugins = {}});
++    if (!vpn_client.Start()) {
++      SPDLOG_ERROR("Cannot start the FPTN connection");
++      stack.Stop();
++      return EXIT_FAILURE;
++    }
++
++    /* ---- VLESS inbound ---- */
++    boost::asio::io_context ioc;
++    fptn::vless::VlessServer::Config vless_config;
++    vless_config.listen_address = args.get<std::string>("--listen");
++    vless_config.port = static_cast<std::uint16_t>(port);
++    vless_config.uuid = uuid;
++    fptn::vless::VlessServer vless(ioc, vless_config, stack);
++    if (!vless.Start()) {
++      vpn_client.Stop();
++      stack.Stop();
++      return EXIT_FAILURE;
++    }
++
++    const std::string host_hint =
++        vless_config.listen_address == "0.0.0.0"
++            ? std::string("<IP-of-this-PC>")
++            : vless_config.listen_address;
++    std::cout << fmt::format(
++        "\nConnected to FPTN server '{}'. VLESS inbound is ready:\n\n"
++        "  vless://{}@{}:{}?encryption=none&security=none&type=tcp#fptn-{}\n\n"
++        "Protocol vless, transport tcp, security none. Press Ctrl+C to stop.\n"
++        "Windows may ask to allow the firewall - allow it for private "
++        "networks.\n\n",
++        selected_server.name, fptn::vless::UuidToString(uuid), host_hint, port,
++        selected_server.name);
++
++    boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
++    signals.async_wait([&](auto, auto) { ioc.stop(); });
++
++    boost::asio::steady_timer watchdog(ioc);
++    std::function<void()> check = [&]() {
++      if (!vpn_client.IsStarted()) {
++        SPDLOG_ERROR("FPTN connection lost! Exiting...");
++        ioc.stop();
++        return;
++      }
++      watchdog.expires_after(std::chrono::seconds(1));
++      watchdog.async_wait([&](const boost::system::error_code& ec) {
++        if (!ec) {
++          check();
++        }
++      });
++    };
++    check();
++    ioc.run();
++
++    /* ---- shutdown: nothing to roll back on the OS ---- */
++    vless.Stop();
++    vpn_client.Stop();
++    stack.Stop();
++    spdlog::shutdown();
++    return EXIT_SUCCESS;
++  } catch (const std::exception& ex) {
++    SPDLOG_ERROR("An error occurred: {}. Exiting...", ex.what());
++  } catch (...) {
++    SPDLOG_ERROR("An unknown error occurred. Exiting...");
++  }
++  return EXIT_FAILURE;
++}
+diff --git a/src/fptn-vless/lwip_port/arch/cc.h b/src/fptn-vless/lwip_port/arch/cc.h
+new file mode 100644
+index 0000000..858c8d0
+--- /dev/null
++++ b/src/fptn-vless/lwip_port/arch/cc.h
+@@ -0,0 +1,21 @@
++#pragma once
++/* lwIP platform glue (NO_SYS=1). Works with GCC/Clang and MSVC. */
++#include <stdio.h>
++#include <stdlib.h>
++
++#define LWIP_PLATFORM_DIAG(x) \
++  do {                        \
++  } while (0)
++#define LWIP_PLATFORM_ASSERT(x)                                  \
++  do {                                                           \
++    fprintf(stderr, "lwIP assert: %s (%s:%d)\n", x, __FILE__, __LINE__); \
++    abort();                                                     \
++  } while (0)
++#define LWIP_RAND() ((u32_t)rand())
++
++#if defined(_MSC_VER)
++#define PACK_STRUCT_BEGIN __pragma(pack(push, 1))
++#define PACK_STRUCT_END __pragma(pack(pop))
++#define PACK_STRUCT_STRUCT
++#define PACK_STRUCT_FIELD(x) x
++#endif
+diff --git a/src/fptn-vless/lwip_port/lwipopts.h b/src/fptn-vless/lwip_port/lwipopts.h
+new file mode 100644
+index 0000000..5e90c9a
+--- /dev/null
++++ b/src/fptn-vless/lwip_port/lwipopts.h
+@@ -0,0 +1,46 @@
++#pragma once
++/*
++ * lwIP configuration for fptn-vless: a client-only userspace TCP/IP stack that
++ * replaces the OS TUN adapter. IPv4 + TCP + UDP(DNS) + ICMP, no ARP/Ethernet.
++ */
++#define NO_SYS 1
++#define SYS_LIGHTWEIGHT_PROT 0
++#define LWIP_SOCKET 0
++#define LWIP_NETCONN 0
++#define LWIP_IPV4 1
++#define LWIP_IPV6 0
++#define LWIP_TCP 1
++#define LWIP_UDP 1
++#define LWIP_ICMP 1
++#define LWIP_RAW 0
++#define LWIP_DNS 1
++#define DNS_MAX_SERVERS 2
++#define DNS_TABLE_SIZE 32
++#define LWIP_ARP 0
++#define LWIP_ETHERNET 0
++#define LWIP_DHCP 0
++#define LWIP_AUTOIP 0
++#define LWIP_IGMP 0
++#define LWIP_STATS 0
++#define LWIP_NETIF_LOOPBACK 0
++
++/* memory */
++#define MEM_ALIGNMENT 8
++#define MEM_SIZE (16 * 1024 * 1024)
++#define MEMP_NUM_PBUF 512
++#define PBUF_POOL_SIZE 4096
++#define PBUF_POOL_BUFSIZE 1536
++#define MEMP_NUM_TCP_PCB 2048
++#define MEMP_NUM_TCP_PCB_LISTEN 8
++#define MEMP_NUM_TCP_SEG 8192
++#define MEMP_NUM_UDP_PCB 8
++#define MEMP_NUM_SYS_TIMEOUT 16
++
++/* tcp (MTU 1420 - 40 bytes of headers - options headroom) */
++#define TCP_MSS 1360
++#define LWIP_WND_SCALE 1
++#define TCP_RCV_SCALE 2
++#define TCP_WND (128 * 1024)
++#define TCP_SND_BUF (64 * 1024)
++#define TCP_SND_QUEUELEN ((4 * (TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS))
++#define TCP_QUEUE_OOSEQ 1
+diff --git a/src/fptn-vless/test/echo_peer.cpp b/src/fptn-vless/test/echo_peer.cpp
+new file mode 100644
+index 0000000..f569f2d
+--- /dev/null
++++ b/src/fptn-vless/test/echo_peer.cpp
+@@ -0,0 +1,132 @@
++// Test peer: a second lwIP instance (10.0.0.2) in its own process. It plays the
++// "remote host behind the FPTN server". IP packets travel over stdin/stdout as
++// frames: [u16 big-endian length][packet].
++//   port 7  : echo (small messages)
++//   port 9  : source - sends kSourceBytes of pattern (i % 251), then closes
++//   port 19 : sink   - counts bytes + byte sum, answers [u32 count][u32 sum] on FIN
++#include <poll.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++extern "C" {
++#include "lwip/init.h"
++#include "lwip/ip.h"
++#include "lwip/netif.h"
++#include "lwip/pbuf.h"
++#include "lwip/tcp.h"
++#include "lwip/timeouts.h"
++u32_t sys_now(void) {
++  static const auto t0 = std::chrono::steady_clock::now();
++  return (u32_t)std::chrono::duration_cast<std::chrono::milliseconds>(
++      std::chrono::steady_clock::now() - t0).count();
++}
++}
++
++static constexpr std::size_t kSourceBytes = 4 * 1024 * 1024;
++
++static bool WriteAll(int fd, const void* d, size_t n) {
++  const char* p = static_cast<const char*>(d);
++  while (n > 0) {
++    ssize_t w = write(fd, p, n);
++    if (w <= 0) return false;
++    p += w; n -= (size_t)w;
++  }
++  return true;
++}
++
++static err_t IpOut(struct netif*, struct pbuf* p, const ip4_addr_t*) {
++  std::vector<uint8_t> f(2 + p->tot_len);
++  f[0] = (uint8_t)(p->tot_len >> 8); f[1] = (uint8_t)p->tot_len;
++  pbuf_copy_partial(p, f.data() + 2, p->tot_len, 0);
++  WriteAll(1, f.data(), f.size());
++  return ERR_OK;
++}
++static err_t NetifInit(struct netif* n) {
++  n->name[0] = 'p'; n->name[1] = 'r'; n->output = IpOut; n->mtu = 1420;
++  n->flags = NETIF_FLAG_UP | NETIF_FLAG_LINK_UP; return ERR_OK;
++}
++
++struct Conn { uint16_t port; size_t sent = 0; uint32_t count = 0, sum = 0; };
++
++static void SourcePump(tcp_pcb* pcb, Conn* c) {
++  while (c->sent < kSourceBytes && tcp_sndbuf(pcb) > 0) {
++    size_t n = std::min<size_t>({tcp_sndbuf(pcb), kSourceBytes - c->sent, 8192});
++    std::vector<uint8_t> buf(n);
++    for (size_t i = 0; i < n; ++i) buf[i] = (uint8_t)((c->sent + i) % 251);
++    if (tcp_write(pcb, buf.data(), (u16_t)n, TCP_WRITE_FLAG_COPY) != ERR_OK) break;
++    c->sent += n;
++  }
++  tcp_output(pcb);
++  if (c->sent >= kSourceBytes) {
++    tcp_arg(pcb, nullptr); tcp_sent(pcb, nullptr); tcp_recv(pcb, nullptr);
++    tcp_close(pcb); delete c;
++  }
++}
++static err_t OnSent(void* a, tcp_pcb* pcb, u16_t) {
++  if (a) { SourcePump(pcb, static_cast<Conn*>(a)); }
++  return ERR_OK;
++}
++static err_t OnRecv(void* a, tcp_pcb* pcb, pbuf* p, err_t) {
++  Conn* c = static_cast<Conn*>(a);
++  if (!c) { if (p) pbuf_free(p); return ERR_OK; }
++  if (!p) {  // FIN
++    if (c->port == 19) {
++      uint8_t r[8] = {(uint8_t)(c->count >> 24), (uint8_t)(c->count >> 16), (uint8_t)(c->count >> 8), (uint8_t)c->count,
++                      (uint8_t)(c->sum >> 24), (uint8_t)(c->sum >> 16), (uint8_t)(c->sum >> 8), (uint8_t)c->sum};
++      tcp_write(pcb, r, 8, TCP_WRITE_FLAG_COPY); tcp_output(pcb);
++    }
++    tcp_arg(pcb, nullptr); tcp_recv(pcb, nullptr); tcp_close(pcb); delete c; return ERR_OK;
++  }
++  std::vector<uint8_t> d(p->tot_len); pbuf_copy_partial(p, d.data(), p->tot_len, 0);
++  u16_t len = p->tot_len; pbuf_free(p); tcp_recved(pcb, len);
++  if (c->port == 7) { tcp_write(pcb, d.data(), len, TCP_WRITE_FLAG_COPY); tcp_output(pcb); }
++  else if (c->port == 19) { c->count += len; for (auto b : d) c->sum += b; }
++  return ERR_OK;
++}
++static err_t OnAccept(void* a, tcp_pcb* pcb, err_t) {
++  uint16_t port = (uint16_t)(uintptr_t)a;
++  auto* c = new Conn{port};
++  tcp_arg(pcb, c); tcp_recv(pcb, OnRecv); tcp_sent(pcb, OnSent); tcp_nagle_disable(pcb);
++  if (port == 9) SourcePump(pcb, c);
++  return ERR_OK;
++}
++static void Listen(uint16_t port) {
++  tcp_pcb* l = tcp_new(); tcp_bind(l, IP_ANY_TYPE, port); l = tcp_listen(l);
++  tcp_arg(l, (void*)(uintptr_t)port); tcp_accept(l, OnAccept);
++}
++
++int main() {
++  lwip_init();
++  static netif nif; ip4_addr_t ip, mask, gw;
++  IP4_ADDR(&ip, 10, 0, 0, 2); IP4_ADDR(&mask, 255, 255, 255, 255); ip4_addr_set_zero(&gw);
++  netif_add(&nif, &ip, &mask, &gw, nullptr, NetifInit, ip_input);
++  netif_set_default(&nif); netif_set_up(&nif);
++  Listen(7); Listen(9); Listen(19);
++  std::vector<uint8_t> in; uint8_t tmp[65536];
++  for (;;) {
++    pollfd pfd{0, POLLIN, 0};
++    u32_t ms = sys_timeouts_sleeptime(); if (ms > 20) ms = 20;
++    int r = poll(&pfd, 1, (int)ms);
++    if (r > 0) {
++      ssize_t n = read(0, tmp, sizeof(tmp));
++      if (n <= 0) return 0;
++      in.insert(in.end(), tmp, tmp + n);
++      size_t off = 0;
++      while (in.size() - off >= 2) {
++        size_t len = ((size_t)in[off] << 8) | in[off + 1];
++        if (in.size() - off - 2 < len) break;
++        pbuf* p = pbuf_alloc(PBUF_RAW, (u16_t)len, PBUF_POOL);
++        if (p) { pbuf_take(p, &in[off + 2], (u16_t)len); if (nif.input(p, &nif) != ERR_OK) pbuf_free(p); }
++        off += 2 + len;
++      }
++      in.erase(in.begin(), in.begin() + off);
++    }
++    sys_check_timeouts();
++  }
++}
+diff --git a/src/fptn-vless/test/loopback_test.cpp b/src/fptn-vless/test/loopback_test.cpp
+new file mode 100644
+index 0000000..d516bec
+--- /dev/null
++++ b/src/fptn-vless/test/loopback_test.cpp
+@@ -0,0 +1,215 @@
++// End-to-end test: VLESS client -> VlessServer -> UserspaceStack(lwIP) -> framed
++// IP packets over pipes -> echo_peer (second lwIP) and back. No fptn deps.
++#include <signal.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <iostream>
++#include <thread>
++#include <vector>
++
++#include <boost/asio.hpp>
++
++#include "fptn-vless/userspace_stack.h"
++#include "fptn-vless/vless_server.h"
++
++using namespace fptn::vless;
++namespace asio = boost::asio;
++using asio::ip::tcp;
++
++static int g_fail = 0;
++#define CHECK(cond, msg)                                              \
++  do {                                                                \
++    if (!(cond)) { std::printf("  FAIL: %s\n", msg); ++g_fail; }       \
++    else { std::printf("  ok:   %s\n", msg); }                         \
++  } while (0)
++
++static bool ReadFull(int fd, void* d, size_t n) {
++  char* p = static_cast<char*>(d);
++  while (n) { ssize_t r = read(fd, p, n); if (r <= 0) return false; p += r; n -= (size_t)r; }
++  return true;
++}
++
++static Uuid g_uuid;
++static uint16_t g_port = 18800;
++
++static std::vector<uint8_t> Header(const Uuid& u, uint8_t atype, const std::vector<uint8_t>& addr, uint16_t port) {
++  std::vector<uint8_t> h{0};
++  h.insert(h.end(), u.begin(), u.end());
++  h.push_back(0);        // addons len
++  h.push_back(1);        // cmd TCP
++  h.push_back((uint8_t)(port >> 8)); h.push_back((uint8_t)port);
++  h.push_back(atype);
++  h.insert(h.end(), addr.begin(), addr.end());
++  return h;
++}
++
++static tcp::socket Dial(asio::io_context& ioc) {
++  tcp::socket s(ioc);
++  s.connect({asio::ip::make_address("127.0.0.1"), g_port});
++  return s;
++}
++static std::vector<uint8_t> To10_0_0_2() { return {10, 0, 0, 2}; }
++
++int main() {
++  setvbuf(stdout, nullptr, _IONBF, 0);
++  signal(SIGPIPE, SIG_IGN);
++  g_uuid = GenerateUuid();
++
++  int to_peer[2], from_peer[2];
++  if (pipe(to_peer) || pipe(from_peer)) return 2;
++  pid_t pid = fork();
++  if (pid == 0) {
++    dup2(to_peer[0], 0); dup2(from_peer[1], 1);
++    close(to_peer[1]); close(from_peer[0]);
++    execl("./echo_peer", "echo_peer", (char*)nullptr);
++    _exit(127);
++  }
++  close(to_peer[0]); close(from_peer[1]);
++
++  auto& stack = UserspaceStack::Instance();
++  UserspaceStack::Config sc; sc.ipv4 = "10.0.0.1"; sc.mtu = 1420;
++  if (!stack.Start(sc)) { std::puts("stack start failed"); return 2; }
++
++  std::atomic<bool> run{true};
++  std::thread tx([&] {  // stack -> peer
++    std::vector<uint8_t> buf(65536);
++    while (run) {
++      int n = stack.TakeOutput(buf.data(), buf.size(), 5);
++      if (n <= 0) continue;
++      uint8_t hdr[2] = {(uint8_t)(n >> 8), (uint8_t)n};
++      if (write(to_peer[1], hdr, 2) != 2 || write(to_peer[1], buf.data(), (size_t)n) != n) break;
++    }
++  });
++  std::thread rx([&] {  // peer -> stack
++    std::vector<uint8_t> buf(65536);
++    for (;;) {
++      uint8_t hdr[2];
++      if (!ReadFull(from_peer[0], hdr, 2)) break;
++      size_t n = ((size_t)hdr[0] << 8) | hdr[1];
++      if (!ReadFull(from_peer[0], buf.data(), n)) break;
++      stack.Input(buf.data(), n);
++    }
++  });
++
++  asio::io_context ioc;
++  VlessServer::Config vc; vc.listen_address = "127.0.0.1"; vc.port = g_port; vc.uuid = g_uuid;
++  vc.connect_timeout_sec = 3; vc.linger_after_remote_close_sec = 2;
++  VlessServer server(ioc, vc, stack);
++  if (!server.Start()) { std::puts("server start failed"); return 2; }
++  auto guard = asio::make_work_guard(ioc);
++  std::thread io([&] { ioc.run(); });
++
++  asio::io_context cio;
++  boost::system::error_code ec;
++
++  std::puts("[1] echo through the tunnel");
++  {
++    auto s = Dial(cio);
++    auto h = Header(g_uuid, 1, To10_0_0_2(), 7);
++    h.insert(h.end(), {'h', 'e', 'l', 'l', 'o'});
++    asio::write(s, asio::buffer(h));
++    uint8_t resp[7]; asio::read(s, asio::buffer(resp), ec);
++    CHECK(!ec && resp[0] == 0 && resp[1] == 0, "VLESS response header 00 00");
++    CHECK(!ec && std::memcmp(resp + 2, "hello", 5) == 0, "payload echoed back");
++  }
++
++  std::puts("[2] download 4 MiB (lwIP -> socket, backpressure)");
++  {
++    auto t0 = std::chrono::steady_clock::now();
++    auto s = Dial(cio);
++    asio::write(s, asio::buffer(Header(g_uuid, 1, To10_0_0_2(), 9)));
++    uint8_t resp[2]; asio::read(s, asio::buffer(resp));
++    size_t total = 0; bool pattern_ok = true; uint8_t buf[65536];
++    for (;;) {
++      size_t n = s.read_some(asio::buffer(buf), ec);
++      for (size_t i = 0; i < n; ++i) if (buf[i] != (uint8_t)((total + i) % 251)) pattern_ok = false;
++      total += n;
++      if (ec) break;
++    }
++    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++    CHECK(total == 4u * 1024 * 1024, "received exactly 4 MiB");
++    CHECK(pattern_ok, "byte pattern intact");
++    std::printf("        %.2f s, %.1f MiB/s\n", sec, 4.0 / sec);
++  }
++
++  std::puts("[3] upload 4 MiB (socket -> lwIP) + half-close");
++  {
++    auto t0 = std::chrono::steady_clock::now();
++    auto s = Dial(cio);
++    auto h = Header(g_uuid, 1, To10_0_0_2(), 19);
++    asio::write(s, asio::buffer(h));
++    std::vector<uint8_t> chunk(32768); uint32_t sum = 0; size_t sent = 0;
++    const size_t N = 4u * 1024 * 1024;
++    while (sent < N) {
++      for (size_t i = 0; i < chunk.size(); ++i) { chunk[i] = (uint8_t)((sent + i) % 251); sum += chunk[i]; }
++      asio::write(s, asio::buffer(chunk));
++      sent += chunk.size();
++    }
++    s.shutdown(tcp::socket::shutdown_send);
++    uint8_t resp[2 + 8]; asio::read(s, asio::buffer(resp), ec);
++    uint32_t cnt = (uint32_t)resp[2] << 24 | resp[3] << 16 | resp[4] << 8 | resp[5];
++    uint32_t sm = (uint32_t)resp[6] << 24 | resp[7] << 16 | resp[8] << 8 | resp[9];
++    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++    CHECK(!ec, "peer answered after FIN");
++    CHECK(cnt == N, "peer counted 4 MiB");
++    CHECK(sm == sum, "peer checksum matches");
++    std::printf("        %.2f s, %.1f MiB/s\n", sec, 4.0 / sec);
++  }
++
++  std::puts("[4] 8 parallel downloads");
++  {
++    std::atomic<int> good{0};
++    std::vector<std::thread> th;
++    auto t0 = std::chrono::steady_clock::now();
++    for (int i = 0; i < 8; ++i) th.emplace_back([&] {
++      asio::io_context c2; tcp::socket s(c2); boost::system::error_code e;
++      s.connect({asio::ip::make_address("127.0.0.1"), g_port});
++      asio::write(s, asio::buffer(Header(g_uuid, 1, To10_0_0_2(), 9)));
++      size_t total = 0; uint8_t buf[65536];
++      for (;;) { size_t n = s.read_some(asio::buffer(buf), e); total += n; if (e) break; }
++      if (total == 2 + 4u * 1024 * 1024) ++good;
++    });
++    for (auto& t : th) t.join();
++    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++    CHECK(good == 8, "all 8 downloads complete with the right size");
++    std::printf("        %.2f s total (%.1f MiB/s aggregate)\n", sec, 32.0 / sec);
++  }
++
++  std::puts("[5] error handling");
++  {
++    Uuid bad = g_uuid; bad[0] ^= 0xFF;
++    auto s = Dial(cio);
++    asio::write(s, asio::buffer(Header(bad, 1, To10_0_0_2(), 7)));
++    uint8_t b[1]; s.read_some(asio::buffer(b), ec);
++    CHECK(ec == asio::error::eof || ec == asio::error::connection_reset, "wrong UUID -> connection closed");
++  }
++  {
++    auto t0 = std::chrono::steady_clock::now();
++    auto s = Dial(cio);
++    asio::write(s, asio::buffer(Header(g_uuid, 1, {10, 0, 0, 99}, 80)));
++    uint8_t b[1]; s.read_some(asio::buffer(b), ec);
++    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++    CHECK(ec && sec > 2.0 && sec < 6.0, "unreachable target -> closed by connect timeout (~3 s)");
++  }
++  {
++    auto s = Dial(cio);
++    auto h = Header(g_uuid, 1, To10_0_0_2(), 4444);  // closed port -> RST
++    asio::write(s, asio::buffer(h));
++    uint8_t b[1]; s.read_some(asio::buffer(b), ec);
++    CHECK(ec, "closed remote port -> connection closed");
++  }
++
++  std::printf("\n%s  (stack drops in/out: %llu/%llu)\n", g_fail ? "FAILED" : "ALL PASSED",
++      (unsigned long long)stack.DroppedIn(), (unsigned long long)stack.DroppedOut());
++
++  run = false; server.Stop(); guard.reset(); ioc.stop();
++  kill(pid, SIGTERM); waitpid(pid, nullptr, 0);
++  close(to_peer[1]); tx.join(); io.join(); rx.join();
++  stack.Stop();
++  return g_fail ? 1 : 0;
++}
+diff --git a/src/fptn-vless/userspace_stack.cpp b/src/fptn-vless/userspace_stack.cpp
+new file mode 100644
+index 0000000..21cfd7e
+--- /dev/null
++++ b/src/fptn-vless/userspace_stack.cpp
+@@ -0,0 +1,456 @@
++#include "fptn-vless/userspace_stack.h"
++
++#include <algorithm>
++#include <chrono>
++#include <future>
++
++#include <spdlog/spdlog.h>  // NOLINT(build/include_order)
++
++extern "C" {
++#include "lwip/dns.h"
++#include "lwip/init.h"
++#include "lwip/ip.h"
++#include "lwip/ip4_addr.h"
++#include "lwip/netif.h"
++#include "lwip/pbuf.h"
++#include "lwip/tcp.h"
++#include "lwip/timeouts.h"
++}
++
++extern "C" u32_t sys_now(void) {
++  static const auto start = std::chrono::steady_clock::now();
++  return static_cast<u32_t>(
++      std::chrono::duration_cast<std::chrono::milliseconds>(
++          std::chrono::steady_clock::now() - start)
++          .count());
++}
++
++namespace fptn::vless {
++
++namespace {
++constexpr std::size_t kMaxQueuedPackets = 16384;
++}
++
++struct LwipGlue {
++  struct DnsCtx {
++    TcpFlowPtr flow;
++    std::uint16_t port;
++  };
++
++  static err_t NetifInit(struct netif* nif) {
++    nif->name[0] = 'f';
++    nif->name[1] = 'p';
++    nif->output = &IpOutput;
++    nif->linkoutput = nullptr;
++    nif->mtu = 1420;
++    nif->flags = NETIF_FLAG_UP | NETIF_FLAG_LINK_UP;
++    return ERR_OK;
++  }
++
++  // lwIP -> tunnel
++  static err_t IpOutput(
++      struct netif* nif, struct pbuf* p, const ip4_addr_t* /*ipaddr*/) {
++    auto* stack = static_cast<UserspaceStack*>(nif->state);
++    Bytes pkt(p->tot_len);
++    pbuf_copy_partial(p, pkt.data(), p->tot_len, 0);
++    {
++      const std::lock_guard<std::mutex> lock(stack->out_mu_);
++      if (stack->out_q_.size() >= kMaxQueuedPackets) {
++        ++stack->dropped_out_;
++        return ERR_OK;
++      }
++      stack->out_q_.push_back(std::move(pkt));
++    }
++    stack->out_cv_.notify_one();
++    return ERR_OK;
++  }
++
++  // tunnel -> lwIP
++  static void Inject(struct netif* nif, const Bytes& data) {
++    struct pbuf* p = pbuf_alloc(PBUF_RAW, static_cast<u16_t>(data.size()),
++        PBUF_POOL);
++    if (p == nullptr) {
++      return;
++    }
++    if (pbuf_take(p, data.data(), static_cast<u16_t>(data.size())) != ERR_OK ||
++        nif->input(p, nif) != ERR_OK) {
++      pbuf_free(p);
++    }
++  }
++
++  static void Fail(const TcpFlowPtr& flow) {
++    flow->pcb_ = nullptr;
++    auto cb = std::move(flow->cb_);
++    flow->cb_ = {};
++    flow->stack_->flows_.erase(flow);
++    if (cb.on_connected) {
++      cb.on_connected(false);
++    }
++  }
++
++  static void BeginConnect(
++      const TcpFlowPtr& flow, const ip_addr_t* addr, std::uint16_t port) {
++    if (!flow->cb_.on_connected) {  // closed while resolving
++      flow->stack_->flows_.erase(flow);
++      return;
++    }
++    tcp_pcb* pcb = tcp_new();
++    if (pcb == nullptr) {
++      Fail(flow);
++      return;
++    }
++    flow->pcb_ = pcb;
++    tcp_arg(pcb, flow.get());
++    tcp_recv(pcb, &OnRecv);
++    tcp_sent(pcb, &OnSent);
++    tcp_err(pcb, &OnErr);
++    tcp_nagle_disable(pcb);
++    if (tcp_connect(pcb, addr, port, &OnConnected) != ERR_OK) {
++      tcp_arg(pcb, nullptr);
++      tcp_err(pcb, nullptr);
++      tcp_abort(pcb);
++      Fail(flow);
++    }
++  }
++
++  static void StartFlow(UserspaceStack& stack,
++      const TcpFlowPtr& flow,
++      const Target& target) {
++    stack.flows_.insert(flow);
++    ip_addr_t addr;
++    if (target.is_ipv4) {
++      ip_addr_set_ip4_u32(&addr, target.ipv4_be);
++      BeginConnect(flow, &addr, target.port);
++      return;
++    }
++    auto* ctx = new DnsCtx{flow, target.port};
++    const err_t e = dns_gethostbyname(target.host.c_str(), &addr, &DnsFound, ctx);
++    if (e == ERR_OK) {
++      std::unique_ptr<DnsCtx> own(ctx);
++      BeginConnect(flow, &addr, target.port);
++    } else if (e != ERR_INPROGRESS) {
++      std::unique_ptr<DnsCtx> own(ctx);
++      Fail(flow);
++    }
++  }
++
++  static void DnsFound(
++      const char* /*name*/, const ip_addr_t* addr, void* arg) {
++    std::unique_ptr<DnsCtx> ctx(static_cast<DnsCtx*>(arg));
++    if (addr == nullptr) {
++      Fail(ctx->flow);
++      return;
++    }
++    BeginConnect(ctx->flow, addr, ctx->port);
++  }
++
++  static err_t OnConnected(void* arg, tcp_pcb* /*pcb*/, err_t err) {
++    auto* f = static_cast<TcpFlow*>(arg);
++    if (err != ERR_OK) {
++      return err;
++    }
++    f->connected_ = true;
++    if (f->cb_.on_connected) {
++      f->cb_.on_connected(true);
++    }
++    f->Pump();
++    return ERR_OK;
++  }
++
++  static err_t OnRecv(void* arg, tcp_pcb* /*pcb*/, struct pbuf* p, err_t err) {
++    auto* f = static_cast<TcpFlow*>(arg);
++    if (p == nullptr) {  // remote FIN
++      if (f != nullptr && f->cb_.on_eof) {
++        f->cb_.on_eof();
++      }
++      return ERR_OK;
++    }
++    if (err != ERR_OK || f == nullptr || !f->cb_.on_data) {
++      pbuf_free(p);
++      return ERR_OK;
++    }
++    const u16_t len = p->tot_len;
++    Bytes data(len);
++    pbuf_copy_partial(p, data.data(), len, 0);
++    pbuf_free(p);
++
++    std::weak_ptr<TcpFlow> weak = f->weak_from_this();
++    UserspaceStack* stack = f->stack_;
++    f->cb_.on_data(std::move(data), [weak, stack, len]() {
++      stack->Post([weak, len]() {
++        if (auto fl = weak.lock(); fl && fl->pcb_ != nullptr) {
++          tcp_recved(fl->pcb_, len);
++        }
++      });
++    });
++    return ERR_OK;
++  }
++
++  static err_t OnSent(void* arg, tcp_pcb* /*pcb*/, u16_t /*len*/) {
++    if (auto* f = static_cast<TcpFlow*>(arg)) {
++      f->Pump();
++    }
++    return ERR_OK;
++  }
++
++  // The pcb has already been freed by lwIP when this runs.
++  static void OnErr(void* arg, err_t /*err*/) {
++    auto* f = static_cast<TcpFlow*>(arg);
++    if (f == nullptr) {
++      return;
++    }
++    const TcpFlowPtr self = f->shared_from_this();
++    f->pcb_ = nullptr;
++    auto cb = std::move(f->cb_);
++    f->cb_ = {};
++    f->accepted_ = nullptr;
++    f->stack_->flows_.erase(self);
++    if (!f->connected_) {
++      if (cb.on_connected) {
++        cb.on_connected(false);
++      }
++    } else if (cb.on_error) {
++      cb.on_error();
++    }
++  }
++
++  static void CloseFlow(const TcpFlowPtr& flow, bool abort) {
++    flow->cb_ = {};
++    flow->accepted_ = nullptr;
++    if (flow->pcb_ != nullptr) {
++      tcp_pcb* pcb = flow->pcb_;
++      flow->pcb_ = nullptr;
++      tcp_arg(pcb, nullptr);
++      tcp_recv(pcb, nullptr);
++      tcp_sent(pcb, nullptr);
++      tcp_err(pcb, nullptr);
++      if (abort || tcp_close(pcb) != ERR_OK) {
++        tcp_abort(pcb);
++      }
++    }
++    flow->stack_->flows_.erase(flow);
++  }
++};
++
++/* ------------------------------ TcpFlow ------------------------------ */
++
++void TcpFlow::Write(Bytes data, std::function<void()> accepted) {
++  stack_->Post([self = shared_from_this(), d = std::move(data),
++                   a = std::move(accepted)]() mutable {
++    if (self->pcb_ == nullptr) {
++      return;
++    }
++    self->pending_ = std::move(d);
++    self->pending_off_ = 0;
++    self->accepted_ = std::move(a);
++    self->Pump();
++  });
++}
++
++void TcpFlow::ShutdownWrite() {
++  stack_->Post([self = shared_from_this()]() {
++    self->want_fin_ = true;
++    self->Pump();
++  });
++}
++
++void TcpFlow::Close(bool abort) {
++  stack_->Post([self = shared_from_this(), abort]() {
++    LwipGlue::CloseFlow(self, abort);
++  });
++}
++
++void TcpFlow::Pump() {
++  if (pcb_ == nullptr || !connected_) {
++    return;
++  }
++  while (pending_off_ < pending_.size()) {
++    const u16_t room = tcp_sndbuf(pcb_);
++    if (room == 0) {
++      break;
++    }
++    const std::size_t n = std::min<std::size_t>(room, pending_.size() - pending_off_);
++    const err_t e = tcp_write(pcb_, pending_.data() + pending_off_,
++        static_cast<u16_t>(n), TCP_WRITE_FLAG_COPY);
++    if (e == ERR_MEM) {
++      break;  // retry from OnSent
++    }
++    if (e != ERR_OK) {
++      LwipGlue::CloseFlow(shared_from_this(), true);
++      return;
++    }
++    pending_off_ += n;
++  }
++  tcp_output(pcb_);
++  if (pending_off_ >= pending_.size()) {
++    pending_.clear();
++    pending_off_ = 0;
++    if (accepted_) {
++      auto done = std::move(accepted_);
++      accepted_ = nullptr;
++      done();
++    }
++    if (want_fin_ && !fin_sent_ && pcb_ != nullptr) {
++      fin_sent_ = true;
++      tcp_shutdown(pcb_, 0, 1);
++    }
++  }
++}
++
++/* --------------------------- UserspaceStack --------------------------- */
++
++UserspaceStack& UserspaceStack::Instance() {
++  static UserspaceStack instance;
++  return instance;
++}
++
++bool UserspaceStack::Start(const Config& config) {
++  if (running_.exchange(true)) {
++    return false;
++  }
++  auto ready = std::make_shared<std::promise<bool>>();
++  auto fut = ready->get_future();
++  thread_ = std::thread(&UserspaceStack::Run, this, config, ready);
++  if (!fut.get()) {
++    running_ = false;
++    if (thread_.joinable()) {
++      thread_.join();
++    }
++    return false;
++  }
++  return true;
++}
++
++void UserspaceStack::Stop() {
++  if (!running_.exchange(false)) {
++    return;
++  }
++  cv_.notify_all();
++  out_cv_.notify_all();
++  if (thread_.joinable()) {
++    thread_.join();
++  }
++}
++
++void UserspaceStack::Post(std::function<void()> fn) {
++  {
++    const std::lock_guard<std::mutex> lock(mu_);
++    tasks_.push_back(std::move(fn));
++  }
++  cv_.notify_one();
++}
++
++void UserspaceStack::Input(const std::uint8_t* data, std::size_t size) {
++  if (data == nullptr || size == 0 || size > 0xFFFF) {
++    return;
++  }
++  {
++    const std::lock_guard<std::mutex> lock(mu_);
++    if (in_q_.size() >= kMaxQueuedPackets) {
++      ++dropped_in_;
++      return;
++    }
++    in_q_.emplace_back(data, data + size);
++  }
++  cv_.notify_one();
++}
++
++int UserspaceStack::TakeOutput(
++    std::uint8_t* buf, std::size_t cap, int timeout_ms) {
++  std::unique_lock<std::mutex> lock(out_mu_);
++  if (out_q_.empty()) {
++    out_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
++        [this]() { return !out_q_.empty() || !running_; });
++  }
++  if (out_q_.empty()) {
++    return 0;
++  }
++  Bytes pkt = std::move(out_q_.front());
++  out_q_.pop_front();
++  lock.unlock();
++  if (pkt.size() > cap) {
++    ++dropped_out_;
++    return 0;
++  }
++  std::copy(pkt.begin(), pkt.end(), buf);
++  return static_cast<int>(pkt.size());
++}
++
++TcpFlowPtr UserspaceStack::Connect(Target target, FlowCallbacks callbacks) {
++  auto flow = std::make_shared<TcpFlow>(this);
++  flow->cb_ = std::move(callbacks);
++  Post([this, flow, t = std::move(target)]() {
++    LwipGlue::StartFlow(*this, flow, t);
++  });
++  return flow;
++}
++
++void UserspaceStack::Run(
++    Config config, std::shared_ptr<std::promise<bool>> ready) {
++  lwip_init();
++
++  ip4_addr_t ip;
++  ip4_addr_t mask;
++  ip4_addr_t gw;
++  if (!ip4addr_aton(config.ipv4.c_str(), &ip)) {
++    SPDLOG_ERROR("userspace stack: bad IPv4 address '{}'", config.ipv4);
++    ready->set_value(false);
++    return;
++  }
++  IP4_ADDR(&mask, 255, 255, 255, 255);
++  ip4_addr_set_zero(&gw);
++
++  static struct netif nif;
++  netif_add(&nif, &ip, &mask, &gw, this, &LwipGlue::NetifInit, &ip_input);
++  nif.mtu = static_cast<u16_t>(config.mtu);
++  netif_set_default(&nif);
++  netif_set_up(&nif);
++  netif_set_link_up(&nif);
++
++  if (!config.dns_ipv4.empty()) {
++    ip_addr_t dns;
++    if (ip4addr_aton(config.dns_ipv4.c_str(), ip_2_ip4(&dns))) {
++      dns_setserver(0, &dns);
++    } else {
++      SPDLOG_WARN("userspace stack: bad DNS address '{}'", config.dns_ipv4);
++    }
++  }
++  ready->set_value(true);
++
++  while (running_) {
++    std::deque<std::function<void()>> tasks;
++    std::deque<Bytes> packets;
++    {
++      std::unique_lock<std::mutex> lock(mu_);
++      if (tasks_.empty() && in_q_.empty()) {
++        u32_t sleep_ms = sys_timeouts_sleeptime();
++        if (sleep_ms == SYS_TIMEOUTS_SLEEPTIME_INFINITE || sleep_ms > 50) {
++          sleep_ms = 50;
++        }
++        cv_.wait_for(lock, std::chrono::milliseconds(sleep_ms));
++      }
++      tasks.swap(tasks_);
++      packets.swap(in_q_);
++    }
++    for (const auto& pkt : packets) {
++      LwipGlue::Inject(&nif, pkt);
++    }
++    for (auto& task : tasks) {
++      task();
++    }
++    sys_check_timeouts();
++  }
++
++  for (const auto& flow : flows_) {  // drop everything on shutdown
++    if (flow->pcb_ != nullptr) {
++      tcp_pcb* pcb = flow->pcb_;
++      flow->pcb_ = nullptr;
++      tcp_arg(pcb, nullptr);
++      tcp_err(pcb, nullptr);
++      tcp_abort(pcb);
++    }
++  }
++  flows_.clear();
++}
++
++}  // namespace fptn::vless
+diff --git a/src/fptn-vless/userspace_stack.h b/src/fptn-vless/userspace_stack.h
+new file mode 100644
+index 0000000..43a1d7b
+--- /dev/null
++++ b/src/fptn-vless/userspace_stack.h
+@@ -0,0 +1,142 @@
++#pragma once
++
++/*
++ * Userspace TCP/IP client stack (lwIP) that stands in for the OS TUN adapter.
++ *
++ *   TCP flow  --lwIP-->  IP packets  --Device::Read-->  libfptn  -->  FPTN server
++ *   TCP flow  <--lwIP--  IP packets  <--Device::Write--  libfptn  <--  FPTN server
++ *
++ * Nothing here touches the Windows network configuration: no adapter, no
++ * routes, no DNS changes.
++ *
++ * Threading: lwIP (NO_SYS) is single-threaded, so every lwIP call happens on
++ * one private "stack thread". Public methods below are thread-safe and only
++ * enqueue work for that thread. Callbacks in FlowCallbacks run ON the stack
++ * thread and must not block; hand work off to your own executor.
++ */
++
++#include <atomic>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <deque>
++#include <future>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <unordered_set>
++#include <vector>
++
++struct tcp_pcb;  // lwIP type, kept opaque
++
++namespace fptn::vless {
++
++using Bytes = std::vector<std::uint8_t>;
++
++class UserspaceStack;
++struct LwipGlue;
++
++struct Target {
++  bool is_ipv4 = false;
++  std::uint32_t ipv4_be = 0;  // network byte order, valid if is_ipv4
++  std::string host;           // valid if !is_ipv4 (resolved through the tunnel)
++  std::uint16_t port = 0;
++};
++
++struct FlowCallbacks {
++  // Connect result. After on_connected(false) the flow is dead.
++  std::function<void(bool ok)> on_connected;
++  // Payload from the remote side. The receive window only reopens once
++  // `consumed` has been called (from any thread) -> natural backpressure.
++  std::function<void(Bytes data, std::function<void()> consumed)> on_data;
++  // Remote sent FIN. We can still write.
++  std::function<void()> on_eof;
++  // Connection reset / aborted / timed out after it was established.
++  std::function<void()> on_error;
++};
++
++class TcpFlow : public std::enable_shared_from_this<TcpFlow> {
++ public:
++  explicit TcpFlow(UserspaceStack* stack) : stack_(stack) {}
++
++  // At most ONE Write may be outstanding. `accepted` is invoked (on the stack
++  // thread) once all of `data` has been taken into the lwIP send buffer.
++  void Write(Bytes data, std::function<void()> accepted);
++  // Send FIN once pending data is flushed.
++  void ShutdownWrite();
++  // abort=true sends RST, abort=false closes gracefully. No callbacks after.
++  void Close(bool abort);
++
++ private:
++  friend class UserspaceStack;
++  friend struct LwipGlue;
++  void Pump();  // stack thread
++
++  UserspaceStack* stack_;
++  tcp_pcb* pcb_ = nullptr;
++  FlowCallbacks cb_;
++  Bytes pending_;
++  std::size_t pending_off_ = 0;
++  std::function<void()> accepted_;
++  bool want_fin_ = false;
++  bool fin_sent_ = false;
++  bool connected_ = false;
++};
++using TcpFlowPtr = std::shared_ptr<TcpFlow>;
++
++class UserspaceStack {
++ public:
++  struct Config {
++    std::string ipv4 = "10.0.0.1";  // must equal the client's tun address
++    std::string dns_ipv4;           // DNS server announced by the FPTN server
++    int mtu = 1420;
++  };
++
++  static UserspaceStack& Instance();
++
++  // lwIP keeps global state: Start() may be called once per process.
++  bool Start(const Config& config);
++  void Stop();
++  bool IsRunning() const { return running_; }
++
++  // Tunnel side. Thread-safe.
++  void Input(const std::uint8_t* data, std::size_t size);
++  // Blocks up to timeout_ms; returns packet size copied to buf, 0 if none.
++  int TakeOutput(std::uint8_t* buf, std::size_t cap, int timeout_ms);
++
++  // Application side. Thread-safe, asynchronous.
++  TcpFlowPtr Connect(Target target, FlowCallbacks callbacks);
++
++  void Post(std::function<void()> fn);
++
++  std::uint64_t DroppedIn() const { return dropped_in_; }
++  std::uint64_t DroppedOut() const { return dropped_out_; }
++
++ private:
++  UserspaceStack() = default;
++  ~UserspaceStack() { Stop(); }
++  friend struct LwipGlue;
++  friend class TcpFlow;
++
++  void Run(Config config, std::shared_ptr<std::promise<bool>> ready);
++
++  std::atomic<bool> running_{false};
++  std::thread thread_;
++
++  std::mutex mu_;
++  std::condition_variable cv_;
++  std::deque<std::function<void()>> tasks_;
++  std::deque<Bytes> in_q_;
++
++  std::mutex out_mu_;
++  std::condition_variable out_cv_;
++  std::deque<Bytes> out_q_;
++
++  std::unordered_set<TcpFlowPtr> flows_;  // stack thread only
++  std::atomic<std::uint64_t> dropped_in_{0};
++  std::atomic<std::uint64_t> dropped_out_{0};
++};
++
++}  // namespace fptn::vless
+diff --git a/src/fptn-vless/userspace_tun_device.h b/src/fptn-vless/userspace_tun_device.h
+new file mode 100644
+index 0000000..0257159
+--- /dev/null
++++ b/src/fptn-vless/userspace_tun_device.h
+@@ -0,0 +1,58 @@
++#pragma once
++
++/*
++ * "TUN device" that is not a TUN device: packets go to / come from the
++ * userspace lwIP stack instead of an OS adapter. Selected at compile time by
++ * FPTN_USERSPACE_TUN (see common/network/net_interface.h).
++ *
++ * Satisfies the duck-typed Device concept of GenericTunInterface. Everything
++ * that would touch the OS (adapter creation, IP/MTU configuration, routes) is
++ * deliberately a no-op, which is the whole point of this fork.
++ */
++
++#include <atomic>
++#include <string>
++
++#include "fptn-vless/userspace_stack.h"
++
++namespace fptn::common::network {
++
++class UserspaceTunDevice {
++ public:
++  // The stack is configured and started by main() before VpnManager::Start().
++  bool Open(const std::string& name) {
++    name_ = name;
++    return fptn::vless::UserspaceStack::Instance().IsRunning();
++  }
++  void Close() {}
++  [[nodiscard]] const std::string& GetName() const { return name_; }
++
++  bool ConfigureIPv4(const std::string&, int) { return true; }
++  bool ConfigureIPv6(const std::string&, int) { return true; }
++  void SetNonBlocking(bool) {}
++  void SetMTU(int) {}
++  bool BringUp() { return true; }
++  void SetStopFlag(const std::atomic<bool>*) {}
++
++  // Packets lwIP wants to send towards the FPTN server. Waits up to 2 ms,
++  // returns 0 when there is nothing (same contract as the Wintun device).
++  int Read(void* buffer, int size) {
++    return fptn::vless::UserspaceStack::Instance().TakeOutput(
++        static_cast<std::uint8_t*>(buffer), static_cast<std::size_t>(size), 2);
++  }
++
++  // Packets that arrived from the FPTN server, destined to lwIP.
++  int Write(const void* data, int size) {
++    if (data == nullptr || size <= 0) {
++      return 0;
++    }
++    fptn::vless::UserspaceStack::Instance().Input(
++        static_cast<const std::uint8_t*>(data), static_cast<std::size_t>(size));
++    return size;
++  }
++
++ private:
++  std::string name_;
++};
++
++}  // namespace fptn::common::network
+diff --git a/src/fptn-vless/vless_server.cpp b/src/fptn-vless/vless_server.cpp
+new file mode 100644
+index 0000000..e2beaae
+--- /dev/null
++++ b/src/fptn-vless/vless_server.cpp
+@@ -0,0 +1,422 @@
++#include "fptn-vless/vless_server.h"
++
++#include <cstdio>
++#include <deque>
++#include <random>
++#include <utility>
++
++#include <spdlog/spdlog.h>  // NOLINT(build/include_order)
++
++namespace asio = boost::asio;
++using asio::ip::tcp;
++
++namespace fptn::vless {
++
++bool ParseUuid(const std::string& text, Uuid& out) {
++  std::string hex;
++  for (const char c : text) {
++    if (c != '-') {
++      hex.push_back(c);
++    }
++  }
++  if (hex.size() != 32) {
++    return false;
++  }
++  for (std::size_t i = 0; i < 16; ++i) {
++    unsigned value = 0;
++    if (std::sscanf(hex.c_str() + i * 2, "%2x", &value) != 1) {  // NOLINT
++      return false;
++    }
++    out[i] = static_cast<std::uint8_t>(value);
++  }
++  return true;
++}
++
++std::string UuidToString(const Uuid& u) {
++  char buf[40];
++  std::snprintf(buf, sizeof(buf),  // NOLINT
++      "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
++      u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11],
++      u[12], u[13], u[14], u[15]);
++  return buf;
++}
++
++Uuid GenerateUuid() {
++  std::random_device rd;
++  Uuid u{};
++  for (auto& b : u) {
++    b = static_cast<std::uint8_t>(rd());
++  }
++  u[6] = (u[6] & 0x0F) | 0x40;  // version 4
++  u[8] = (u[8] & 0x3F) | 0x80;
++  return u;
++}
++
++class VlessSession : public std::enable_shared_from_this<VlessSession> {
++ public:
++  VlessSession(asio::io_context& ioc, tcp::socket socket,
++      const VlessServer::Config& config, UserspaceStack& stack)
++      : ioc_(ioc),
++        socket_(std::move(socket)),
++        config_(config),
++        stack_(stack),
++        timer_(ioc) {}
++
++  ~VlessSession() {
++    if (flow_) {
++      flow_->Close(true);
++    }
++  }
++
++  // The session owns itself until Finish(): otherwise nothing would keep it
++  // alive while we wait for the upstream connect or after a client half-close.
++  void Start() {
++    keepalive_ = shared_from_this();
++    ReadFixedHeader();
++  }
++
++ private:
++  struct Chunk {
++    Bytes data;
++    std::function<void()> consumed;
++  };
++
++  /* ---------------------------- header ---------------------------- */
++
++  void ReadFixedHeader() {
++    asio::async_read(socket_, asio::buffer(head_, 18),
++        [self = shared_from_this()](const boost::system::error_code& ec,
++            std::size_t) {
++          if (ec) {
++            return self->Finish(true);
++          }
++          if (self->head_[0] != 0 ||
++              !std::equal(self->head_ + 1, self->head_ + 17,
++                  self->config_.uuid.begin())) {
++            SPDLOG_WARN("vless: bad version or uuid from {}",
++                self->RemoteName());
++            return self->Finish(true);
++          }
++          self->ReadAddons(self->head_[17]);
++        });
++  }
++
++  void ReadAddons(std::size_t len) {
++    addons_.resize(len);
++    if (len == 0) {
++      return ReadCommand();
++    }
++    asio::async_read(socket_, asio::buffer(addons_),
++        [self = shared_from_this()](const boost::system::error_code& ec,
++            std::size_t) {
++          if (ec) {
++            return self->Finish(true);
++          }
++          self->ReadCommand();
++        });
++  }
++
++  void ReadCommand() {
++    asio::async_read(socket_, asio::buffer(cmd_, 4),
++        [self = shared_from_this()](const boost::system::error_code& ec,
++            std::size_t) {
++          if (ec) {
++            return self->Finish(true);
++          }
++          const std::uint8_t cmd = self->cmd_[0];
++          self->target_.port = static_cast<std::uint16_t>(
++              (self->cmd_[1] << 8) | self->cmd_[2]);
++          const std::uint8_t atype = self->cmd_[3];
++          if (cmd != 1) {
++            SPDLOG_WARN("vless: unsupported command {} (only TCP)", cmd);
++            return self->Finish(true);
++          }
++          self->ReadAddress(atype);
++        });
++  }
++
++  void ReadAddress(std::uint8_t atype) {
++    if (atype == 1) {
++      asio::async_read(socket_, asio::buffer(addr_, 4),
++          [self = shared_from_this()](const boost::system::error_code& ec,
++              std::size_t) {
++            if (ec) {
++              return self->Finish(true);
++            }
++            self->target_.is_ipv4 = true;
++            std::copy(self->addr_, self->addr_ + 4,
++                reinterpret_cast<std::uint8_t*>(&self->target_.ipv4_be));
++            self->ConnectUpstream();
++          });
++    } else if (atype == 2) {
++      asio::async_read(socket_, asio::buffer(addr_, 1),
++          [self = shared_from_this()](const boost::system::error_code& ec,
++              std::size_t) {
++            if (ec || self->addr_[0] == 0) {
++              return self->Finish(true);
++            }
++            self->host_.resize(self->addr_[0]);
++            asio::async_read(self->socket_, asio::buffer(self->host_),
++                [self](const boost::system::error_code& ec2, std::size_t) {
++                  if (ec2) {
++                    return self->Finish(true);
++                  }
++                  self->target_.is_ipv4 = false;
++                  self->target_.host = self->host_;
++                  self->ConnectUpstream();
++                });
++          });
++    } else {
++      SPDLOG_WARN("vless: unsupported address type {} (IPv6?)", atype);
++      Finish(true);
++    }
++  }
++
++  /* --------------------------- upstream --------------------------- */
++
++  void ConnectUpstream() {
++    std::weak_ptr<VlessSession> weak = weak_from_this();
++    asio::io_context* ioc = &ioc_;  // do not capture `this`: lwIP callbacks may outlive the session
++    auto post = [ioc, weak](auto fn) {
++      asio::post(*ioc, [weak, fn = std::move(fn)]() mutable {
++        if (auto s = weak.lock()) {
++          fn(*s);
++        }
++      });
++    };
++
++    FlowCallbacks cb;
++    cb.on_connected = [post](bool ok) {
++      post([ok](VlessSession& s) { s.OnUpstreamConnected(ok); });
++    };
++    cb.on_data = [post](Bytes data, std::function<void()> consumed) {
++      post([d = std::move(data), c = std::move(consumed)](
++               VlessSession& s) mutable {
++        s.down_q_.push_back({std::move(d), std::move(c)});
++        s.PumpDown();
++      });
++    };
++    cb.on_eof = [post]() {
++      post([](VlessSession& s) {
++        s.remote_eof_ = true;
++        s.PumpDown();
++      });
++    };
++    cb.on_error = [post]() {
++      post([](VlessSession& s) {
++        s.flow_.reset();  // already dead
++        s.Finish(true);
++      });
++    };
++
++    timer_.expires_after(std::chrono::seconds(config_.connect_timeout_sec));
++    timer_.async_wait([weak](const boost::system::error_code& ec) {
++      if (!ec) {
++        if (auto s = weak.lock()) {
++          SPDLOG_WARN("vless: upstream connect timeout");
++          s->Finish(true);
++        }
++      }
++    });
++    flow_ = stack_.Connect(target_, std::move(cb));
++  }
++
++  void OnUpstreamConnected(bool ok) {
++    timer_.cancel();
++    if (!ok) {
++      flow_.reset();
++      SPDLOG_WARN("vless: upstream connect failed");
++      return Finish(true);
++    }
++    static const std::uint8_t kResponse[2] = {0, 0};
++    asio::async_write(socket_, asio::buffer(kResponse),
++        [self = shared_from_this()](const boost::system::error_code& ec,
++            std::size_t) {
++          if (ec) {
++            return self->Finish(true);
++          }
++          self->header_sent_ = true;
++          self->PumpUp();
++          self->PumpDown();
++        });
++  }
++
++  /* ----------------------------- relay ----------------------------- */
++
++  // client socket -> tunnel
++  void PumpUp() {
++    socket_.async_read_some(asio::buffer(up_buf_),
++        [self = shared_from_this()](const boost::system::error_code& ec,
++            std::size_t n) {
++          if (!self->flow_) {
++            return;
++          }
++          if (ec) {
++            if (ec == asio::error::eof) {
++              self->client_eof_ = true;
++              self->flow_->ShutdownWrite();
++              self->MaybeFinish();
++            } else {
++              self->Finish(true);
++            }
++            return;
++          }
++          std::weak_ptr<VlessSession> weak = self->weak_from_this();
++          asio::io_context& ioc = self->ioc_;
++          self->flow_->Write(
++              Bytes(self->up_buf_.begin(), self->up_buf_.begin() + n),
++              [weak, &ioc]() {  // stack thread
++                asio::post(ioc, [weak]() {
++                  if (auto s = weak.lock()) {
++                    s->PumpUp();
++                  }
++                });
++              });
++        });
++  }
++
++  // tunnel -> client socket (ordered, one write in flight)
++  void PumpDown() {
++    if (!header_sent_ || writing_ || finished_) {
++      return;
++    }
++    if (down_q_.empty()) {
++      if (remote_eof_ && !remote_done_) {
++        remote_done_ = true;
++        boost::system::error_code ignored;
++        socket_.shutdown(tcp::socket::shutdown_send, ignored);
++        timer_.expires_after(
++            std::chrono::seconds(config_.linger_after_remote_close_sec));
++        timer_.async_wait([weak = weak_from_this()](
++                              const boost::system::error_code& ec) {
++          if (!ec) {
++            if (auto s = weak.lock()) {
++              s->Finish(false);
++            }
++          }
++        });
++        MaybeFinish();
++      }
++      return;
++    }
++    writing_ = true;
++    current_ = std::move(down_q_.front());
++    down_q_.pop_front();
++    asio::async_write(socket_, asio::buffer(current_.data),
++        [self = shared_from_this()](const boost::system::error_code& ec,
++            std::size_t) {
++          self->writing_ = false;
++          if (ec) {
++            return self->Finish(true);
++          }
++          if (self->current_.consumed) {
++            self->current_.consumed();  // reopen the TCP receive window
++          }
++          self->PumpDown();
++        });
++  }
++
++  void MaybeFinish() {
++    if (client_eof_ && remote_done_) {
++      Finish(false);
++    }
++  }
++
++  void Finish(bool abort) {
++    if (finished_) {
++      return;
++    }
++    finished_ = true;
++    timer_.cancel();
++    boost::system::error_code ignored;
++    socket_.close(ignored);
++    if (flow_) {
++      flow_->Close(abort);
++      flow_.reset();
++    }
++    keepalive_.reset();  // must stay the last statement: may destroy `this`
++  }
++
++  std::string RemoteName() {
++    boost::system::error_code ec;
++    const auto ep = socket_.remote_endpoint(ec);
++    return ec ? std::string("?") : ep.address().to_string();
++  }
++
++  asio::io_context& ioc_;
++  tcp::socket socket_;
++  const VlessServer::Config config_;
++  UserspaceStack& stack_;
++  asio::steady_timer timer_;
++
++  std::uint8_t head_[18]{};
++  Bytes addons_;
++  std::uint8_t cmd_[4]{};
++  std::uint8_t addr_[4]{};
++  std::string host_;
++  Target target_;
++
++  std::shared_ptr<VlessSession> keepalive_;
++  TcpFlowPtr flow_;
++  std::array<std::uint8_t, 32 * 1024> up_buf_{};
++  std::deque<Chunk> down_q_;
++  Chunk current_;
++  bool header_sent_ = false;
++  bool writing_ = false;
++  bool remote_eof_ = false;
++  bool remote_done_ = false;
++  bool client_eof_ = false;
++  bool finished_ = false;
++};
++
++VlessServer::VlessServer(
++    asio::io_context& ioc, Config config, UserspaceStack& stack)
++    : ioc_(ioc), config_(std::move(config)), stack_(stack), acceptor_(ioc) {}
++
++bool VlessServer::Start() {
++  boost::system::error_code ec;
++  const auto addr = asio::ip::make_address(config_.listen_address, ec);
++  if (ec) {
++    SPDLOG_ERROR("vless: bad listen address '{}'", config_.listen_address);
++    return false;
++  }
++  const tcp::endpoint ep(addr, config_.port);
++  acceptor_.open(ep.protocol(), ec);
++  acceptor_.set_option(asio::socket_base::reuse_address(true), ec);
++  acceptor_.bind(ep, ec);
++  if (ec) {
++    SPDLOG_ERROR("vless: cannot bind {}:{} ({})", config_.listen_address,
++        config_.port, ec.message());
++    return false;
++  }
++  acceptor_.listen(asio::socket_base::max_listen_connections, ec);
++  if (ec) {
++    return false;
++  }
++  DoAccept();
++  return true;
++}
++
++void VlessServer::Stop() {
++  boost::system::error_code ignored;
++  acceptor_.close(ignored);
++}
++
++void VlessServer::DoAccept() {
++  acceptor_.async_accept(
++      [this](const boost::system::error_code& ec, tcp::socket socket) {
++        if (ec == asio::error::operation_aborted) {
++          return;
++        }
++        if (!ec) {
++          boost::system::error_code ignored;
++          socket.set_option(tcp::no_delay(true), ignored);
++          std::make_shared<VlessSession>(ioc_, std::move(socket), config_,
++              stack_)
++              ->Start();
++        }
++        DoAccept();
++      });
++}
++
++}  // namespace fptn::vless
+diff --git a/src/fptn-vless/vless_server.h b/src/fptn-vless/vless_server.h
+new file mode 100644
+index 0000000..8d865c5
+--- /dev/null
++++ b/src/fptn-vless/vless_server.h
+@@ -0,0 +1,59 @@
++#pragma once
++
++/*
++ * Minimal VLESS inbound (plain TCP, no TLS, no flow): accepts VLESS clients
++ * from the LAN and relays each TCP request through the userspace stack.
++ *
++ * Supported: command TCP (0x01), address types IPv4 / domain.
++ * Not supported (connection is closed): UDP, Mux, IPv6 targets.
++ *
++ * Request header:
++ *   1B version(0) | 16B uuid | 1B addons_len | addons | 1B cmd | 2B port |
++ *   1B addr_type(1=IPv4,2=domain,3=IPv6) | addr
++ * Response header: 1B version(0) | 1B addons_len(0)
++ */
++
++#include <array>
++#include <cstdint>
++#include <memory>
++#include <string>
++
++#include <boost/asio.hpp>
++
++#include "fptn-vless/userspace_stack.h"
++
++namespace fptn::vless {
++
++using Uuid = std::array<std::uint8_t, 16>;
++
++bool ParseUuid(const std::string& text, Uuid& out);
++std::string UuidToString(const Uuid& uuid);
++Uuid GenerateUuid();
++
++class VlessServer {
++ public:
++  struct Config {
++    std::string listen_address = "0.0.0.0";
++    std::uint16_t port = 10800;
++    Uuid uuid{};
++    int connect_timeout_sec = 15;
++    int linger_after_remote_close_sec = 10;
++  };
++
++  VlessServer(boost::asio::io_context& ioc, Config config,
++      UserspaceStack& stack);
++
++  bool Start();  // false if the port cannot be bound
++  void Stop();
++
++ private:
++  friend class VlessSession;
++  void DoAccept();
++
++  boost::asio::io_context& ioc_;
++  Config config_;
++  UserspaceStack& stack_;
++  boost::asio::ip::tcp::acceptor acceptor_;
++};
++
++}  // namespace fptn::vless
