@@ -19,12 +19,12 @@ jobs:
       FPTN_VERSION: 0.0.0-vless
     steps:
       - name: Checkout this repository (patch)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: kit
 
       - name: Checkout official FPTN
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: fptn-project/fptn
           ref: ${{ inputs.upstream_ref }}
@@ -40,7 +40,7 @@ jobs:
           git status --short
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
@@ -53,7 +53,7 @@ jobs:
       # First build compiles Boost, protobuf, BoringSSL... (30-60 min); later
       # runs reuse this cache.
       - name: Cache Conan packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.conan2
           key: conan-win-${{ hashFiles('fptn/conanfile.py', 'fptn/.conan/**') }}
@@ -88,7 +88,7 @@ jobs:
           Get-ChildItem dist
 
       - name: Upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: fptn-vless-windows-x64
           path: dist/*
