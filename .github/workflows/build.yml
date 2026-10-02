@@ -1,0 +1,95 @@
+name: Build fptn-vless.exe
+
+# Actions -> "Build fptn-vless.exe" -> Run workflow.
+# This repository contains ONLY the patch and this workflow. The FPTN sources
+# are downloaded from the official repository at build time and the patch is
+# applied to that temporary copy, so no upstream code lives here.
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Commit of fptn-project/fptn the patch was made against"
+        default: c164fa9d5c76b71fd6011ec70ebe518ba48f6929
+
+jobs:
+  build:
+    runs-on: windows-2022 # the commands below assume Visual Studio 2022
+    timeout-minutes: 300
+    env:
+      FPTN_VERSION: 0.0.0-vless
+    steps:
+      - name: Checkout this repository (patch)
+        uses: actions/checkout@v4
+        with:
+          path: kit
+
+      - name: Checkout official FPTN
+        uses: actions/checkout@v4
+        with:
+          repository: fptn-project/fptn
+          ref: ${{ inputs.upstream_ref }}
+          submodules: true
+          path: fptn
+
+      - name: Apply patch
+        shell: powershell
+        working-directory: fptn
+        run: |
+          git apply --whitespace=nowarn ../kit/fptn-vless.patch
+          if ($LASTEXITCODE -ne 0) { throw "Patch does not apply to this upstream commit" }
+          git status --short
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Conan
+        shell: powershell
+        run: |
+          pip install conan==2.15.1 requests numpy
+          conan profile detect --force
+
+      # First build compiles Boost, protobuf, BoringSSL... (30-60 min); later
+      # runs reuse this cache.
+      - name: Cache Conan packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: conan-win-${{ hashFiles('fptn/conanfile.py', 'fptn/.conan/**') }}
+
+      - name: Install dependencies
+        shell: powershell
+        working-directory: fptn
+        run: |
+          conan install . --output-folder=build --build=missing -o with_gui_client=False --settings build_type=Release -s compiler.cppstd=17
+
+      - name: Configure
+        shell: powershell
+        working-directory: fptn/build
+        run: |
+          cmake .. -G "Visual Studio 17 2022" -DCMAKE_TOOLCHAIN_FILE="conan_toolchain.cmake" -DCMAKE_BUILD_TYPE=Release
+
+      # Only our target: upstream tests, linters and installers are not run.
+      - name: Build fptn-vless
+        shell: powershell
+        working-directory: fptn/build
+        run: |
+          cmake --build . --config Release --target fptn-vless
+
+      - name: Collect
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $exe = Get-ChildItem -Path fptn/build -Recurse -Filter fptn-vless.exe | Select-Object -First 1
+          if (-not $exe) { throw "fptn-vless.exe was not produced" }
+          Copy-Item $exe.FullName dist/
+          Copy-Item fptn/src/fptn-vless/README.md dist/README.md
+          Get-ChildItem dist
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: fptn-vless-windows-x64
+          path: dist/*
+          if-no-files-found: error
