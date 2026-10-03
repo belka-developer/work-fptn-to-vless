@@ -44,6 +44,17 @@ jobs:
         with:
           python-version: "3.13"
 
+      # BoringSSL builds its assembly with NASM on Windows x64 (upstream's
+      # Windows README also requires it on PATH).
+      - name: Install NASM
+        shell: powershell
+        run: |
+          choco install nasm -y --no-progress
+          $dir = "C:\Program Files\NASM"
+          if (-not (Test-Path "$dir\nasm.exe")) { throw "nasm.exe not found in $dir" }
+          Add-Content -Path $env:GITHUB_PATH -Value $dir
+          & "$dir\nasm.exe" -v
+
       - name: Install Conan
         shell: powershell
         run: |
@@ -63,6 +74,12 @@ jobs:
         working-directory: fptn
         run: |
           conan install . --output-folder=build --build=missing -o with_gui_client=False --settings build_type=Release -s compiler.cppstd=17
+
+      - name: Show CMake logs of failed dependency builds
+        if: failure()
+        shell: powershell
+        run: |
+          Get-ChildItem -Path "$env:USERPROFILE\.conan2\p\b" -Recurse -Include CMakeError.log,CMakeConfigureLog.yaml -ErrorAction SilentlyContinue | ForEach-Object { "=== $($_.FullName)"; Get-Content $_.FullName -Tail 80 }
 
       - name: Configure
         shell: powershell
