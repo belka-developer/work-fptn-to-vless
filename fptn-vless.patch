@@ -78,10 +78,10 @@ index 8501a9a..a5b7259 100644
        const std::unique_lock<std::mutex> lock(mutex_);  // mutex
 diff --git a/src/fptn-vless/CMakeLists.txt b/src/fptn-vless/CMakeLists.txt
 new file mode 100644
-index 0000000..7d9cae9
+index 0000000..de84d61
 --- /dev/null
 +++ b/src/fptn-vless/CMakeLists.txt
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,161 @@
 +project(fptn-vless)
 +
 +include(FetchContent)
@@ -164,6 +164,10 @@ index 0000000..7d9cae9
 +add_executable(
 +  "${PROJECT_NAME}"
 +  fptn-vless.cpp
++  failover.cpp
++  failover.h
++  tunnel_manager.cpp
++  tunnel_manager.h
 +  userspace_stack.cpp
 +  userspace_stack.h
 +  userspace_tun_device.h
@@ -231,16 +235,20 @@ index 0000000..7d9cae9
 +  target_link_libraries(
 +    fptn_vless_loopback_test PRIVATE fptn_lwip spdlog::spdlog fmt::fmt
 +                                     Boost::boost)
++  add_executable(fptn_vless_failover_test test/failover_test.cpp failover.cpp)
++  target_link_libraries(fptn_vless_failover_test PRIVATE spdlog::spdlog
++                                                         fmt::fmt)
++  add_test(NAME fptn_vless_failover COMMAND fptn_vless_failover_test)
 +  add_test(NAME fptn_vless_loopback
 +           COMMAND fptn_vless_loopback_test
 +           WORKING_DIRECTORY $<TARGET_FILE_DIR:fptn_vless_echo_peer>)
 +endif()
 diff --git a/src/fptn-vless/README.md b/src/fptn-vless/README.md
 new file mode 100644
-index 0000000..902e952
+index 0000000..d5dc071
 --- /dev/null
 +++ b/src/fptn-vless/README.md
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,100 @@
 +# fptn-vless
 +
 +Консольная утилита: подключается к FPTN по токену и отдаёт туннель в локальную
@@ -255,18 +263,46 @@ index 0000000..902e952
 +## Использование
 +
 +```
-+fptn-vless.exe --access-token <токен>
++fptn-vless.exe                              # спросит токен после запуска
++fptn-vless.exe --token-file token.txt       # токен из текстового файла
 +fptn-vless.exe --access-token <токен> --server 2 --port 10800
 +```
 +
-+Без `--server` программа покажет серверы из токена и спросит номер
-+(Enter = автоматически, самый быстрый). После подключения печатает ссылку:
++Токен можно вставить в консоль после запуска. Консоль Windows режет строку
++примерно на 4 КБ, поэтому если токен очень длинный и его не принимает,
++положите его в текстовый файл и используйте `--token-file`. Пробелы, переводы
++строк и кавычки в токене игнорируются.
++
++При запуске программа замеряет время отклика всех серверов из токена и
++показывает список (мс или «нет ответа»). Без `--server` спросит номер
++(Enter = самый быстрый). Затем печатает готовую ссылку с IP вашего ПК в локальной
++сети (если адресов несколько, ссылки для каждого):
 +
 +```
-+vless://<uuid>@<IP-этого-ПК>:10800?encryption=none&security=none&type=tcp#fptn-<сервер>
++vless://<uuid>@192.168.1.10:10800?encryption=none&security=none&type=tcp&headerType=none#fptn-vless
 +```
 +
-+UUID получается из токена, то есть он стабилен между запусками (или задайте `--uuid`).
++UUID получается из токена, то есть стабилен между запусками (или задайте `--uuid`).
++Если в Incy ссылка не импортируется, добавьте сервер вручную: протокол VLESS,
++адрес/порт из ссылки, UUID, шифрование none, сеть tcp, безопасность none.
++
++## Мульти-подключение (failover)
++
++Каждые 5 минут (`--scan-interval`, 0 = выключить) программа заново замеряет отклик
++всех серверов (без входа в аккаунт, текущую сессию это не трогает) и сама
++переключается на лучший, если:
++
++* текущий сервер не ответил 2 замера подряд или туннель упал (ждём 20 с на
++  самовосстановление), или
++* он медленнее лучшего более чем в 1.5 раза **и** минимум на 150 мс (гистерезис,
++  чтобы не прыгать между близкими серверами). Перед переключением замер
++  подтверждается повторно через 30 с.
++
++Новое соединение сначала поднимается, и только потом заменяет старое. Открытые
++VLESS-соединения при смене сервера обрываются (клиент переподключается сам),
++ссылка и UUID не меняются. `--no-failover` отключает автопереключение.
++Ограничение: сервер, где вход проходит, но туннель не работает, определяется
++только по состоянию, которое сообщает сама библиотека FPTN.
 +
 +| Опция | По умолчанию |
 +|---|---|
@@ -274,6 +310,9 @@ index 0000000..902e952
 +| `--port` | `10800` |
 +| `--bypass-method` | `sni-spoofing-yandex-26-4` |
 +| `--connection-strategy` | `rolling-tunnel` |
++| `--scan-interval` | `300` (секунд) |
++| `--no-failover` | выкл |
++| `--link-host` | авто (IP в LAN), можно задать вручную |
 +| `--sni`, `--mtu-size`, `--uuid` | как в `fptn-client-cli` |
 +
 +## Что изменено в upstream (всего +19/−5 строк)
@@ -290,19 +329,469 @@ index 0000000..902e952
 +* Только TCP. VLESS-UDP (QUIC/HTTP3 с клиентов) не поддержан, приложения откатятся на TCP.
 +* Только IPv4 цели. Домены резолвятся внутри туннеля через DNS сервера FPTN.
 +* VLESS без TLS: только для доверенной LAN. Не пробрасывайте порт наружу.
-+* Брандмауэр Windows спросит разрешение на входящие: разрешите для частных сетей.
++* Брандмауэр Windows спросит разрешение на входящие: разрешите (и для частных, и для общедоступных сетей, если Wi-Fi помечен как публичный).
++
++## Если телефон не подключается
++
++1. Телефон и ПК в одной сети (не гостевой Wi-Fi, не мобильный интернет).
++2. `ipconfig` — IP должен совпадать с тем, что в ссылке (`--link-host`, если нет).
++3. Проверка порта с ПК: `Test-NetConnection <ip> -Port 10800`.
++4. Правило брандмауэра (PowerShell от администратора):
++   `netsh advfirewall firewall add rule name="fptn-vless" dir=in action=allow protocol=TCP localport=10800 profile=any`
++5. В консоли при первом соединении телефона появится строка
++   `New VLESS client connected from <ip>` — если её нет, пакеты не доходят
++   (сеть/брандмауэр); если есть, а интернета нет — смотрите предупреждения ниже неё
++   (UDP и IPv6 цели не поддержаны).
 +
 +## Тесты
 +
 +`fptn_vless_loopback_test` проверяет весь путь VLESS -> lwIP -> IP-пакеты -> второй
 +lwIP без настоящего FPTN-сервера: эхо, 4 МиБ вниз/вверх с проверкой данных,
-+8 параллельных потоков, неверный UUID, таймаут, закрытый порт.
++8 параллельных потоков, неверный UUID, таймаут, закрытый порт, сброс при смене
++сервера. `fptn_vless_failover_test` проверяет логику выбора/переключения серверов.
+diff --git a/src/fptn-vless/failover.cpp b/src/fptn-vless/failover.cpp
+new file mode 100644
+index 0000000..854834d
+--- /dev/null
++++ b/src/fptn-vless/failover.cpp
+@@ -0,0 +1,294 @@
++#include "fptn-vless/failover.h"
++
++#include <algorithm>
++#include <string>
++#include <utility>
++
++#include <spdlog/spdlog.h>  // NOLINT(build/include_order)
++
++namespace fptn::vless {
++
++namespace {
++
++constexpr auto kFreshScan = std::chrono::seconds(60);
++
++// Fastest answering server, optionally ignoring one index.
++std::optional<std::size_t> Best(const std::vector<ServerHealth>& servers,
++    std::optional<std::size_t> skip) {
++  std::optional<std::size_t> best;
++  for (std::size_t i = 0; i < servers.size(); ++i) {
++    if ((skip && *skip == i) || !servers[i].last_ping) {
++      continue;
++    }
++    if (!best || *servers[i].last_ping < *servers[*best].last_ping) {
++      best = i;
++    }
++  }
++  return best;
++}
++
++}  // namespace
++
++Decision Decide(const SwitchPolicy& policy,
++    const std::vector<ServerHealth>& servers,
++    std::optional<std::size_t> active,
++    bool tunnel_down) {
++  Decision decision;
++  if (!active || *active >= servers.size()) {
++    if (const auto best = Best(servers, std::nullopt)) {
++      decision = {true, *best, "no active server"};
++    }
++    return decision;
++  }
++
++  const ServerHealth& current = servers[*active];
++  const bool dead = tunnel_down || (current.probed &&
++                                       current.consecutive_failures >=
++                                           policy.failures_to_drop);
++  if (dead) {
++    if (const auto best = Best(servers, active)) {
++      decision = {true, *best,
++          tunnel_down ? "the connection is lost"
++                      : "the server does not answer"};
++    } else {
++      decision.reason = "no other server answers";
++    }
++    return decision;
++  }
++
++  // Alive. A single missed probe is not a verdict: wait for the re-check.
++  if (!current.last_ping) {
++    return decision;
++  }
++  const auto best = Best(servers, std::nullopt);
++  if (!best || *best == *active) {
++    return decision;
++  }
++  const double cur_ms = *current.last_ping;
++  const double best_ms = *servers[*best].last_ping;
++  if (cur_ms > best_ms * policy.ratio &&
++      cur_ms - best_ms >= static_cast<double>(policy.margin_ms)) {
++    decision = {true, *best, "the ping is high"};
++  }
++  return decision;
++}
++
++std::vector<std::size_t> ConnectOrder(const std::vector<ServerHealth>& servers,
++    std::optional<std::size_t> preferred,
++    std::optional<std::size_t> skip) {
++  std::vector<std::size_t> order;
++  std::vector<bool> taken(servers.size(), false);
++  if (skip && *skip < servers.size()) {
++    taken[*skip] = true;
++  }
++  if (preferred && *preferred < servers.size() && !taken[*preferred]) {
++    order.push_back(*preferred);
++    taken[*preferred] = true;
++  }
++  std::vector<std::size_t> answering;
++  std::vector<std::size_t> silent;
++  for (std::size_t i = 0; i < servers.size(); ++i) {
++    if (!taken[i]) {
++      (servers[i].last_ping ? answering : silent).push_back(i);
++    }
++  }
++  std::stable_sort(answering.begin(), answering.end(),
++      [&servers](std::size_t a, std::size_t b) {
++        return *servers[a].last_ping < *servers[b].last_ping;
++      });
++  order.insert(order.end(), answering.begin(), answering.end());
++  order.insert(order.end(), silent.begin(), silent.end());
++  return order;
++}
++
++/* ------------------------- FailoverController ------------------------- */
++
++FailoverController::FailoverController(
++    std::vector<std::string> names, Options options, Hooks hooks)
++    : options_(std::move(options)), hooks_(std::move(hooks)) {
++  servers_.reserve(names.size());
++  for (auto& name : names) {
++    ServerHealth health;
++    health.name = std::move(name);
++    servers_.push_back(std::move(health));
++  }
++}
++
++FailoverController::~FailoverController() { Stop(); }
++
++std::string FailoverController::Describe(std::size_t index) const {
++  const std::lock_guard<std::mutex> lock(mu_);
++  if (index >= servers_.size()) {
++    return "?";
++  }
++  const auto& s = servers_[index];
++  return s.last_ping ? s.name + " (" + std::to_string(*s.last_ping) + " ms)"
++                     : s.name + " (no response)";
++}
++
++std::vector<ServerHealth> FailoverController::Snapshot() const {
++  const std::lock_guard<std::mutex> lock(mu_);
++  return servers_;
++}
++
++std::optional<std::size_t> FailoverController::Active() const {
++  const std::lock_guard<std::mutex> lock(mu_);
++  return active_;
++}
++
++void FailoverController::ApplyScan(const std::vector<PingMs>& results) {
++  const std::lock_guard<std::mutex> lock(mu_);
++  for (std::size_t i = 0; i < servers_.size() && i < results.size(); ++i) {
++    servers_[i].probed = true;
++    servers_[i].last_ping = results[i];
++    servers_[i].consecutive_failures =
++        results[i] ? 0 : servers_[i].consecutive_failures + 1;
++  }
++  last_scan_ = Clock::now();
++  scanned_ = true;
++}
++
++std::vector<ServerHealth> FailoverController::Scan() {
++  const std::lock_guard<std::mutex> op(op_mu_);
++  ApplyScan(hooks_.probe_all());
++  return Snapshot();
++}
++
++bool FailoverController::TrySwitch(
++    std::size_t target, const std::string& reason) {
++  SPDLOG_INFO("Switching to {}: {}", Describe(target), reason);
++  const bool ok = hooks_.connect(target);
++  const std::lock_guard<std::mutex> lock(mu_);
++  last_switch_ = Clock::now();  // failed attempts are rate-limited too
++  if (ok) {
++    active_ = target;
++    SPDLOG_INFO("Now connected through {}", servers_[target].name);
++  } else {
++    SPDLOG_WARN("Could not switch to {}", servers_[target].name);
++  }
++  return ok;
++}
++
++void FailoverController::FailOver(const std::string& reason) {
++  const std::lock_guard<std::mutex> op(op_mu_);
++  ApplyScan(hooks_.probe_all());
++  const auto order = ConnectOrder(Snapshot(), std::nullopt, Active());
++  for (const std::size_t index : order) {
++    if (stop_) {
++      return;
++    }
++    if (TrySwitch(index, reason)) {
++      return;
++    }
++  }
++  SPDLOG_WARN("No other server could be reached, staying on the current one");
++}
++
++bool FailoverController::Start(std::optional<std::size_t> preferred) {
++  {
++    const std::lock_guard<std::mutex> op(op_mu_);
++    bool fresh = false;
++    {
++      const std::lock_guard<std::mutex> lock(mu_);
++      fresh = scanned_ && Clock::now() - last_scan_ < kFreshScan;
++    }
++    if (!fresh) {
++      ApplyScan(hooks_.probe_all());
++    }
++    bool connected = false;
++    for (const std::size_t index : ConnectOrder(Snapshot(), preferred)) {
++      SPDLOG_INFO("Connecting to {}", Describe(index));
++      if (hooks_.connect(index)) {
++        const std::lock_guard<std::mutex> lock(mu_);
++        active_ = index;
++        last_switch_ = Clock::now();
++        connected = true;
++        break;
++      }
++      SPDLOG_WARN("Server {} is not usable, trying the next one",
++          Snapshot()[index].name);
++    }
++    if (!connected) {
++      return false;
++    }
++  }
++  // With a single server there is nothing to switch to.
++  if (options_.failover && Snapshot().size() > 1) {
++    thread_ = std::thread(&FailoverController::Loop, this);
++  }
++  return true;
++}
++
++void FailoverController::Stop() {
++  stop_ = true;
++  wake_cv_.notify_all();
++  if (thread_.joinable()) {
++    thread_.join();
++  }
++}
++
++void FailoverController::Loop() {
++  const bool periodic = options_.scan_interval.count() > 0;
++  const auto next_after = [&](Ms delay) {
++    return periodic ? Clock::now() + delay : Clock::time_point::max();
++  };
++  auto next_scan = next_after(options_.scan_interval);
++  std::optional<Clock::time_point> down_since;
++
++  while (!stop_) {
++    {
++      std::unique_lock<std::mutex> lock(wake_mu_);
++      wake_cv_.wait_for(lock, options_.tick, [this]() { return stop_.load(); });
++    }
++    if (stop_) {
++      break;
++    }
++    const auto now = Clock::now();
++    const bool down = hooks_.tunnel_down && hooks_.tunnel_down();
++    if (!down) {
++      down_since.reset();
++    } else if (!down_since) {
++      down_since = now;
++    }
++    bool gap_ok = false;
++    {
++      const std::lock_guard<std::mutex> lock(mu_);
++      gap_ok = now - last_switch_ >= options_.min_switch_gap;
++    }
++
++    // 1. The live tunnel lost its connection and did not come back by itself.
++    if (down && gap_ok && now - *down_since >= options_.down_grace) {
++      SPDLOG_WARN("The connection to the server is lost, looking for another");
++      FailOver("the connection is lost");
++      down_since = Clock::now();  // give the new tunnel time to come up
++      next_scan = next_after(options_.scan_interval);
++      continue;
++    }
++
++    // 2. Periodic scan: the server stopped answering or its ping got high.
++    if (periodic && now >= next_scan) {
++      const std::lock_guard<std::mutex> op(op_mu_);
++      if (stop_) {
++        break;
++      }
++      ApplyScan(hooks_.probe_all());
++      const auto snapshot = Snapshot();
++      SPDLOG_INFO("Server scan finished");
++      // Loss of the tunnel is handled by branch 1 (it has the grace period).
++      const Decision d = Decide(options_.policy, snapshot, Active(), false);
++      if (d.do_switch && gap_ok) {
++        TrySwitch(d.target, d.reason);
++      }
++      Ms delay = options_.scan_interval;
++      if (const auto a = Active()) {
++        const int misses = Snapshot()[*a].consecutive_failures;
++        if (misses > 0 && misses < options_.policy.failures_to_drop) {
++          delay = options_.confirm_delay;  // re-check before judging
++        }
++      }
++      next_scan = next_after(delay);
++    }
++  }
++}
++
++}  // namespace fptn::vless
+diff --git a/src/fptn-vless/failover.h b/src/fptn-vless/failover.h
+new file mode 100644
+index 0000000..90c4818
+--- /dev/null
++++ b/src/fptn-vless/failover.h
+@@ -0,0 +1,131 @@
++#pragma once
++
++/*
++ * Multi-server failover: decides WHEN to leave the current FPTN server and
++ * WHICH one to move to. Deliberately free of any FPTN/network types: probing,
++ * connecting and health checks come in as callbacks (Hooks), so the whole
++ * policy can be tested without a server.
++ */
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace fptn::vless {
++
++// Response time in ms; nullopt = no answer.
++using PingMs = std::optional<std::uint32_t>;
++
++struct ServerHealth {
++  std::string name;
++  PingMs last_ping;
++  int consecutive_failures = 0;
++  bool probed = false;
++};
++
++struct SwitchPolicy {
++  // The active server is "slow" only if it is BOTH this many times slower than
++  // the best one AND slower by at least margin_ms. Without the margin a 40 ms
++  // vs 70 ms difference would make us flap between servers.
++  double ratio = 1.5;
++  std::uint32_t margin_ms = 150;
++  // Missed probes in a row before the active server counts as dead (one lost
++  // probe is not enough: it is re-checked after Options::confirm_delay).
++  int failures_to_drop = 2;
++};
++
++struct Decision {
++  bool do_switch = false;
++  std::size_t target = 0;
++  std::string reason;
++};
++
++// Pure function. `tunnel_down` = the live tunnel itself reports a lost
++// connection (independent of the probe results).
++Decision Decide(const SwitchPolicy& policy,
++    const std::vector<ServerHealth>& servers,
++    std::optional<std::size_t> active,
++    bool tunnel_down);
++
++// Order in which servers are tried: `preferred` first, then answering servers
++// by ping, then the silent ones (their API probe may be blocked while the
++// login still works). `skip` is left out.
++std::vector<std::size_t> ConnectOrder(const std::vector<ServerHealth>& servers,
++    std::optional<std::size_t> preferred,
++    std::optional<std::size_t> skip = std::nullopt);
++
++class FailoverController {
++ public:
++  using Ms = std::chrono::milliseconds;
++
++  struct Options {
++    bool failover = true;     // false: connect once, never switch
++    Ms scan_interval{300000};  // 5 min; 0 = no periodic scans
++    Ms confirm_delay{30000};   // re-probe after the active server missed one
++    Ms down_grace{20000};      // tunnel must stay down this long to fail over
++    Ms min_switch_gap{20000};  // never switch more often than this
++    Ms tick{1000};
++    SwitchPolicy policy;
++  };
++
++  struct Hooks {
++    // Probe every server; result i belongs to server i. Blocking.
++    std::function<std::vector<PingMs>()> probe_all;
++    // Make server i the active one. MUST keep the previous tunnel working if
++    // it returns false (prepare the new tunnel first, swap afterwards).
++    std::function<bool(std::size_t)> connect;
++    // The active tunnel has lost its connection.
++    std::function<bool()> tunnel_down;
++  };
++
++  FailoverController(
++      std::vector<std::string> names, Options options, Hooks hooks);
++  ~FailoverController();
++  FailoverController(const FailoverController&) = delete;
++  FailoverController& operator=(const FailoverController&) = delete;
++
++  // Probes all servers now and stores the result.
++  std::vector<ServerHealth> Scan();
++  // Initial connection (uses the last Scan() if it is fresh), then starts the
++  // background monitor. False if no server could be connected.
++  bool Start(std::optional<std::size_t> preferred = std::nullopt);
++  void Stop();
++
++  std::optional<std::size_t> Active() const;
++  std::vector<ServerHealth> Snapshot() const;
++
++ private:
++  using Clock = std::chrono::steady_clock;
++
++  void Loop();
++  bool TrySwitch(std::size_t target, const std::string& reason);
++  void FailOver(const std::string& reason);
++  void ApplyScan(const std::vector<PingMs>& results);
++  std::string Describe(std::size_t index) const;
++
++  const Options options_;
++  const Hooks hooks_;
++
++  mutable std::mutex mu_;  // guards servers_, active_, last_scan_, last_switch_
++  std::vector<ServerHealth> servers_;
++  std::optional<std::size_t> active_;
++  Clock::time_point last_scan_{};
++  Clock::time_point last_switch_{};
++  bool scanned_ = false;
++
++  std::mutex op_mu_;  // serialises Scan / connect / switch operations
++  std::mutex wake_mu_;
++  std::condition_variable wake_cv_;
++  std::atomic<bool> stop_{false};
++  std::thread thread_;
++};
++
++}  // namespace fptn::vless
 diff --git a/src/fptn-vless/fptn-vless.cpp b/src/fptn-vless/fptn-vless.cpp
 new file mode 100644
-index 0000000..d69c6b5
+index 0000000..6d3b216
 --- /dev/null
 +++ b/src/fptn-vless/fptn-vless.cpp
-@@ -0,0 +1,346 @@
+@@ -0,0 +1,479 @@
 +/*
 + * fptn-vless: connect to an FPTN server with an access token and expose the
 + * tunnel to the LAN as a plain VLESS inbound.
@@ -314,10 +803,13 @@ index 0000000..d69c6b5
 +
 +#include <algorithm>
 +#include <cctype>
-+#include <functional>
++#include <chrono>
++#include <fstream>
 +#include <iostream>
++#include <iterator>
 +#include <map>
 +#include <memory>
++#include <optional>
 +#include <string>
 +#include <utility>
 +#include <vector>
@@ -328,15 +820,13 @@ index 0000000..d69c6b5
 +#include <openssl/sha.h>
 +
 +#include "common/logger/logger.h"
-+#include "common/network/ip_address.h"
-+#include "common/network/net_interface.h"
 +
 +#include "config/config_file.h"
 +#include "fptn-protocol-lib/https/censorship_strategy.h"
 +#include "fptn-protocol-lib/time/time_provider.h"
-+#include "routing/route_manager.h"  // ResolveDomain only
-+#include "vpn/vpn_manager.h"
 +
++#include "fptn-vless/failover.h"
++#include "fptn-vless/tunnel_manager.h"
 +#include "fptn-vless/userspace_stack.h"
 +#include "fptn-vless/vless_server.h"
 +
@@ -397,16 +887,130 @@ index 0000000..d69c6b5
 +  });
 +}
 +
++// A token never contains whitespace or quotes, but a paste or a text file
++// often brings line breaks, spaces or quotes along: drop them all.
++std::string CleanToken(const std::string& raw) {
++  std::string token;
++  for (const unsigned char c : raw) {
++    if (std::isspace(c) == 0 && c != '"' && c != '\'') {
++      token.push_back(static_cast<char>(c));
++    }
++  }
++  return token;
++}
++
++// RFC 3986 percent-encoding, for the #fragment (name) of the share link.
++std::string PercentEncode(const std::string& text) {
++  static const char kHex[] = "0123456789ABCDEF";
++  std::string out;
++  for (const unsigned char c : text) {
++    if (std::isalnum(c) != 0 || c == '-' || c == '.' || c == '_' || c == '~') {
++      out.push_back(static_cast<char>(c));
++    } else {
++      out.push_back('%');
++      out.push_back(kHex[c >> 4]);
++      out.push_back(kHex[c & 0x0F]);
++    }
++  }
++  return out;
++}
++
++// IPv4 addresses of this PC. The first one is the address the OS would use to
++// reach the internet (normally the LAN address), the rest are other adapters.
++std::vector<std::string> LanAddresses() {
++  std::vector<std::string> result;
++  const auto add = [&result](const boost::asio::ip::address& address) {
++    if (!address.is_v4() || address.is_loopback() || address.is_unspecified()) {
++      return;
++    }
++    const std::string text = address.to_string();
++    if (text.rfind("169.254.", 0) == 0) {  // link-local, not a real address
++      return;
++    }
++    if (std::find(result.begin(), result.end(), text) == result.end()) {
++      result.push_back(text);
++    }
++  };
++  boost::asio::io_context io;
++  boost::system::error_code ec;
++  {
++    // A UDP "connect" sends nothing: it only asks the OS which local address
++    // it would use for that destination.
++    boost::asio::ip::udp::socket probe(io);
++    probe.open(boost::asio::ip::udp::v4(), ec);
++    if (!ec) {
++      probe.connect({boost::asio::ip::make_address("8.8.8.8"), 53}, ec);
++    }
++    if (!ec) {
++      const auto endpoint = probe.local_endpoint(ec);
++      if (!ec) {
++        add(endpoint.address());
++      }
++    }
++  }
++  const std::string host = boost::asio::ip::host_name(ec);
++  if (!ec) {
++    boost::asio::ip::tcp::resolver resolver(io);
++    const auto found = resolver.resolve(host, "", ec);
++    if (!ec) {
++      for (const auto& entry : found) {
++        add(entry.endpoint().address());
++      }
++    }
++  }
++  return result;
++}
++
++std::string MakeLink(const fptn::vless::Uuid& uuid,
++    const std::string& host,
++    int port) {
++  return fmt::format(
++      "vless://{}@{}:{}?encryption=none&security=none&type=tcp&headerType=none"
++      "#{}",
++      fptn::vless::UuidToString(uuid), host, port, PercentEncode("fptn-vless"));
++}
++
++std::string PingText(const fptn::vless::PingMs& ping) {
++  return ping ? fmt::format("{} ms", *ping) : std::string("no response");
++}
++
++std::string ToLower(std::string text) {
++  std::transform(text.begin(), text.end(), text.begin(),
++      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++  return text;
++}
++
 +}  // namespace
 +
 +int main(int argc, char* argv[]) {
 +  argparse::ArgumentParser args("fptn-vless", FPTN_VERSION);
-+  args.add_argument("--access-token").required().help("FPTN access token");
++  args.add_argument("--access-token")
++      .default_value("")
++      .help("FPTN access token. Empty: read it from --token-file or ask");
++  args.add_argument("--token-file")
++      .default_value("")
++      .help(
++          "Text file with the access token (use it if pasting into the "
++          "console cuts the token off)");
 +  args.add_argument("--server")
 +      .default_value("")
 +      .help(
 +          "Server name or its number from the list. Empty: show the list and "
 +          "ask (Enter = pick automatically)");
++  args.add_argument("--no-failover")
++      .default_value(false)
++      .implicit_value(true)
++      .help("Stay on the chosen server, never switch to another one");
++  args.add_argument("--scan-interval")
++      .default_value(300)
++      .scan<'i', int>()
++      .help(
++          "Seconds between response-time checks of all servers (0 = never). "
++          "If the current server stops answering or gets slow, the program "
++          "moves to the best one");
++  args.add_argument("--link-host")
++      .default_value("")
++      .help("Address to put into the vless:// link (default: detected)");
 +  args.add_argument("--listen")
 +      .default_value("0.0.0.0")
 +      .help("Address of the VLESS inbound (0.0.0.0 = whole LAN)");
@@ -459,7 +1063,36 @@ index 0000000..d69c6b5
 +      SPDLOG_ERROR("--port or --mtu-size is out of range");
 +      return EXIT_FAILURE;
 +    }
-+    const auto access_token = args.get<std::string>("--access-token");
++    std::string access_token =
++        CleanToken(args.get<std::string>("--access-token"));
++    if (access_token.empty()) {
++      if (const auto path = args.get<std::string>("--token-file");
++          !path.empty()) {
++        std::ifstream file(path, std::ios::binary);
++        if (!file) {
++          SPDLOG_ERROR("Cannot open --token-file '{}'", path);
++          return EXIT_FAILURE;
++        }
++        access_token = CleanToken(std::string(
++            std::istreambuf_iterator<char>(file),
++            std::istreambuf_iterator<char>()));
++      } else {
++        std::cout << "Paste the access token and press Enter: " << std::flush;
++        std::string line;
++        std::getline(std::cin, line);
++        access_token = CleanToken(line);
++        // A console line is limited to about 4 KB on Windows: a longer
++        // token arrives cut off and then fails to parse.
++        if (line.size() >= 4000) {
++          std::cout << "\nNote: the token is very long. If it is rejected, "
++                       "put it into a text file and run with --token-file.\n";
++        }
++      }
++    }
++    if (access_token.empty()) {
++      SPDLOG_ERROR("No access token given");
++      return EXIT_FAILURE;
++    }
 +    fptn::vless::Uuid uuid = DeriveUuid(access_token);
 +    if (const auto text = args.get<std::string>("--uuid"); !text.empty()) {
 +      if (!fptn::vless::ParseUuid(text, uuid)) {
@@ -468,7 +1101,7 @@ index 0000000..d69c6b5
 +      }
 +    }
 +
-+    /* ---- token -> server list -> choice ---- */
++    /* ---- token -> server list ---- */
 +    fptn::config::ConfigFile config(access_token, sni, bypass_it->second);
 +    config.Parse();
 +    const auto& servers = config.GetServers();
@@ -476,119 +1109,90 @@ index 0000000..d69c6b5
 +      SPDLOG_ERROR("The token contains no servers");
 +      return EXIT_FAILURE;
 +    }
-+
-+    std::string choice = args.get<std::string>("--server");
-+    if (choice.empty()) {
-+      std::cout << "\nServers in this token:\n";
-+      for (std::size_t i = 0; i < servers.size(); ++i) {
-+        std::cout << fmt::format("  {:>2}. {}  ({}:{})\n", i + 1,
-+            servers[i].name, servers[i].host, servers[i].port);
-+      }
-+      std::cout << "Select server number or name [Enter = automatic]: "
-+                << std::flush;
-+      std::getline(std::cin, choice);
-+    }
-+    if (IsNumber(choice)) {
-+      const auto index = static_cast<std::size_t>(std::stoul(choice));
-+      if (index < 1 || index > servers.size()) {
-+        SPDLOG_ERROR("No server number {}", index);
-+        return EXIT_FAILURE;
-+      }
-+      choice = servers[index - 1].name;
-+    }
-+
-+    fptn::utils::speed_estimator::ServerInfo selected_server;
-+    std::string pre_obtained_token;
-+    if (!choice.empty()) {
-+      auto server = config.GetServer(choice);
-+      if (!server.has_value()) {
-+        SPDLOG_ERROR("Server '{}' does not exist in the token", choice);
-+        return EXIT_FAILURE;
-+      }
-+      selected_server = std::move(*server);
-+    } else {
-+      auto login_result = config.FindServerByLogin(10);
-+      if (!login_result) {
-+        SPDLOG_ERROR("All servers unavailable!");
-+        return EXIT_FAILURE;
-+      }
-+      selected_server = login_result->server;
-+      pre_obtained_token = std::move(login_result->access_token);
-+    }
-+
-+    const auto server_ip = fptn::routing::ResolveDomain(selected_server.host);
-+    if (server_ip.IsEmpty()) {
-+      SPDLOG_ERROR("DNS resolve error: {}", selected_server.host);
-+      return EXIT_FAILURE;
-+    }
-+
-+    /* ---- login (identical to fptn-client-cli) ---- */
-+    const auto tun_ipv4 = fptn::common::network::IPv4Address::Create(
-+        FPTN_CLIENT_DEFAULT_ADDRESS_IP4);
-+    const auto tun_ipv6 = fptn::common::network::IPv6Address::Create(
-+        FPTN_CLIENT_DEFAULT_ADDRESS_IP6);
-+
-+    auto http_client = std::make_unique<fptn::vpn::http::Client>(
-+        fptn::protocol::https::ConnectionConfig{
-+            .common ={
-+                    .server_ip = server_ip,
-+                    .server_port =
-+                        static_cast<std::uint16_t>(selected_server.port),
-+                    .sni = sni,
-+                    .md5_fingerprint = selected_server.md5_fingerprint,
-+                    .client_version = FPTN_VERSION,
-+                    .censorship_strategy = bypass_it->second,
-+                    .tun_interface_address_ipv4 = tun_ipv4,
-+                    .tun_interface_address_ipv6 = tun_ipv6,
-+                }},
-+        strategy_it->second);
-+    if (!pre_obtained_token.empty()) {
-+      http_client->SetAccessToken(pre_obtained_token);
-+    }
-+    if (!http_client->Login(config.GetUsername(), config.GetPassword())) {
-+      SPDLOG_ERROR("Login failed (code {}): {}", http_client->LatestErrorCode(),
-+          http_client->LatestError());
-+      return EXIT_FAILURE;
-+    }
-+    const auto [dns_ipv4, dns_ipv6] = http_client->GetDns();
-+    if (dns_ipv4.IsEmpty()) {
-+      SPDLOG_ERROR("The server did not provide a DNS address");
++    const int scan_interval = args.get<int>("--scan-interval");
++    if (scan_interval < 0) {
++      SPDLOG_ERROR("--scan-interval cannot be negative");
 +      return EXIT_FAILURE;
 +    }
 +
 +    /* ---- userspace stack instead of an OS adapter ---- */
 +    auto& stack = fptn::vless::UserspaceStack::Instance();
 +    fptn::vless::UserspaceStack::Config stack_config;
-+    stack_config.ipv4 = tun_ipv4.ToString();
-+    stack_config.dns_ipv4 = dns_ipv4.ToString();
-+    stack_config.mtu = mtu_size;
++    stack_config.ipv4 = FPTN_CLIENT_DEFAULT_ADDRESS_IP4;
++    stack_config.mtu = mtu_size;  // DNS is set when a tunnel comes up
 +    if (!stack.Start(stack_config)) {
 +      SPDLOG_ERROR("Cannot start the userspace network stack");
 +      return EXIT_FAILURE;
 +    }
 +
-+    auto virtual_network_interface =
-+        std::make_shared<fptn::common::network::TunInterface>(
-+            fptn::common::network::TunInterface::Config{
-+                .name = "fptn-userspace",
-+                .mtu_size = mtu_size,
-+                .using_rate_calculator = false,
-+                .ipv4_addr = tun_ipv4,
-+                .ipv4_netmask = 32,
-+                .ipv6_addr = tun_ipv6,
-+                .ipv6_netmask = 126});
++    /* ---- servers: probing, connecting, failover ---- */
++    fptn::vless::TunnelManager::Options tunnel_options;
++    tunnel_options.sni = sni;
++    tunnel_options.censorship_strategy = bypass_it->second;
++    tunnel_options.connection_strategy = strategy_it->second;
++    tunnel_options.mtu_size = mtu_size;
++    fptn::vless::TunnelManager tunnels(config, tunnel_options);
 +
-+    // No route manager, no plugins: nothing is changed on this machine.
-+    fptn::vpn::VpnManager vpn_client(
-+        fptn::vpn::VpnManager::Config{.http_client = std::move(http_client),
-+            .route_manager = nullptr,
-+            .virtual_net_interface = virtual_network_interface,
-+            .plugins = {}});
-+    if (!vpn_client.Start()) {
-+      SPDLOG_ERROR("Cannot start the FPTN connection");
++    std::vector<std::string> names;
++    for (const auto& server : servers) {
++      names.push_back(server.name);
++    }
++    fptn::vless::FailoverController::Options failover_options;
++    failover_options.failover = !args.get<bool>("--no-failover");
++    failover_options.scan_interval = std::chrono::seconds(scan_interval);
++    fptn::vless::FailoverController::Hooks hooks;
++    hooks.probe_all = [&tunnels]() { return tunnels.ProbeAll(); };
++    hooks.connect = [&tunnels](std::size_t i) { return tunnels.Connect(i); };
++    hooks.tunnel_down = [&tunnels]() { return tunnels.IsDown(); };
++    fptn::vless::FailoverController controller(
++        names, failover_options, hooks);
++
++    std::cout << "\nMeasuring response time of the servers..." << std::flush;
++    const auto health = controller.Scan();
++    std::cout << " done\n\nServers in this token:\n";
++    for (std::size_t i = 0; i < servers.size(); ++i) {
++      std::cout << fmt::format("  {:>2}. {:<28} {}\n", i + 1, servers[i].name,
++          PingText(health[i].last_ping));
++    }
++
++    std::string choice = args.get<std::string>("--server");
++    if (choice.empty()) {
++      std::cout << "\nServer number or name [Enter = fastest, switches "
++                   "automatically]: "
++                << std::flush;
++      std::getline(std::cin, choice);
++      choice = CleanToken(choice);  // trims spaces; names have none
++    }
++    std::optional<std::size_t> preferred;
++    if (IsNumber(choice)) {
++      const auto number = static_cast<std::size_t>(std::stoul(choice));
++      if (number < 1 || number > servers.size()) {
++        SPDLOG_ERROR("No server number {}", number);
++        stack.Stop();
++        return EXIT_FAILURE;
++      }
++      preferred = number - 1;
++    } else if (!choice.empty()) {
++      for (std::size_t i = 0; i < servers.size(); ++i) {
++        if (ToLower(servers[i].name) == ToLower(choice)) {
++          preferred = i;
++        }
++      }
++      if (!preferred) {
++        SPDLOG_ERROR("Server '{}' does not exist in the token", choice);
++        stack.Stop();
++        return EXIT_FAILURE;
++      }
++    }
++
++    std::cout << "\nConnecting...\n";
++    if (!controller.Start(preferred)) {
++      SPDLOG_ERROR("None of the servers could be connected!");
 +      stack.Stop();
 +      return EXIT_FAILURE;
 +    }
++    const auto active = controller.Active();
++    const std::string active_name = active ? servers[*active].name : "?";
 +
 +    /* ---- VLESS inbound ---- */
 +    boost::asio::io_context ioc;
@@ -598,47 +1202,65 @@ index 0000000..d69c6b5
 +    vless_config.uuid = uuid;
 +    fptn::vless::VlessServer vless(ioc, vless_config, stack);
 +    if (!vless.Start()) {
-+      vpn_client.Stop();
++      controller.Stop();
++      tunnels.Shutdown();
 +      stack.Stop();
 +      return EXIT_FAILURE;
 +    }
 +
-+    const std::string host_hint =
-+        vless_config.listen_address == "0.0.0.0"
-+            ? std::string("<IP-of-this-PC>")
-+            : vless_config.listen_address;
++    std::vector<std::string> hosts;
++    if (const auto forced = args.get<std::string>("--link-host");
++        !forced.empty()) {
++      hosts.push_back(forced);
++    } else if (vless_config.listen_address != "0.0.0.0") {
++      hosts.push_back(vless_config.listen_address);
++    } else {
++      hosts = LanAddresses();
++    }
++    if (hosts.empty()) {
++      hosts.push_back("127.0.0.1");
++      std::cout << "\nCould not detect the address of this PC: run `ipconfig`, "
++                   "take the IPv4 address and put it into the link instead of "
++                   "127.0.0.1.\n";
++    }
++
 +    std::cout << fmt::format(
-+        "\nConnected to FPTN server '{}'. VLESS inbound is ready:\n\n"
-+        "  vless://{}@{}:{}?encryption=none&security=none&type=tcp#fptn-{}\n\n"
-+        "Protocol vless, transport tcp, security none. Press Ctrl+C to stop.\n"
-+        "Windows may ask to allow the firewall - allow it for private "
-+        "networks.\n\n",
-+        selected_server.name, fptn::vless::UuidToString(uuid), host_hint, port,
-+        selected_server.name);
++        "\nConnected to FPTN server '{}'.{}\n\nVLESS inbound is ready. Link "
++        "for your phone / other PC:\n\n  {}\n",
++        active_name,
++        failover_options.failover && servers.size() > 1
++            ? fmt::format(" The program will switch to a better server by "
++                          "itself ({}).",
++                  scan_interval > 0
++                      ? fmt::format("servers are checked every {} s",
++                            scan_interval)
++                      : std::string("when the connection is lost"))
++            : std::string(),
++        MakeLink(uuid, hosts.front(), port));
++    if (hosts.size() > 1) {
++      std::cout << "\nOther addresses of this PC (if the first one does not "
++                   "work):\n";
++      for (std::size_t i = 1; i < hosts.size(); ++i) {
++        std::cout << "  " << MakeLink(uuid, hosts[i], port) << "\n";
++      }
++    }
++    std::cout << fmt::format(
++        "\nIf the link is not accepted, enter it by hand: protocol VLESS, "
++        "address {}, port {}, user id {}, network tcp, security none, "
++        "encryption none, flow empty.\n"
++        "Phone and PC must be in the same network (not a guest Wi-Fi), and "
++        "the Windows firewall prompt must be allowed for PRIVATE networks.\n"
++        "Press Ctrl+C to stop.\n\n",
++        hosts.front(), port, fptn::vless::UuidToString(uuid));
 +
 +    boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
 +    signals.async_wait([&](auto, auto) { ioc.stop(); });
-+
-+    boost::asio::steady_timer watchdog(ioc);
-+    std::function<void()> check = [&]() {
-+      if (!vpn_client.IsStarted()) {
-+        SPDLOG_ERROR("FPTN connection lost! Exiting...");
-+        ioc.stop();
-+        return;
-+      }
-+      watchdog.expires_after(std::chrono::seconds(1));
-+      watchdog.async_wait([&](const boost::system::error_code& ec) {
-+        if (!ec) {
-+          check();
-+        }
-+      });
-+    };
-+    check();
 +    ioc.run();
 +
 +    /* ---- shutdown: nothing to roll back on the OS ---- */
 +    vless.Stop();
-+    vpn_client.Stop();
++    controller.Stop();
++    tunnels.Shutdown();
 +    stack.Stop();
 +    spdlog::shutdown();
 +    return EXIT_SUCCESS;
@@ -866,12 +1488,344 @@ index 0000000..f569f2d
 +    sys_check_timeouts();
 +  }
 +}
+diff --git a/src/fptn-vless/test/failover_test.cpp b/src/fptn-vless/test/failover_test.cpp
+new file mode 100644
+index 0000000..5ff8125
+--- /dev/null
++++ b/src/fptn-vless/test/failover_test.cpp
+@@ -0,0 +1,326 @@
++// Tests of the failover policy and controller with a fake "world": pings,
++// connect results and tunnel health are scripted, no network, no FPTN server.
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <functional>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++#include "fptn-vless/failover.h"
++
++using namespace fptn::vless;
++using namespace std::chrono_literals;
++
++static int g_fail = 0;
++#define CHECK(cond, msg)                                         \
++  do {                                                           \
++    if (!(cond)) {                                               \
++      std::printf("  FAIL: %s\n", msg);                          \
++      ++g_fail;                                                  \
++    } else {                                                     \
++      std::printf("  ok:   %s\n", msg);                          \
++    }                                                            \
++  } while (0)
++
++static bool WaitFor(const std::function<bool()>& pred, int timeout_ms) {
++  const auto end = std::chrono::steady_clock::now() +
++                   std::chrono::milliseconds(timeout_ms);
++  while (std::chrono::steady_clock::now() < end) {
++    if (pred()) return true;
++    std::this_thread::sleep_for(5ms);
++  }
++  return pred();
++}
++
++static ServerHealth H(const char* name, PingMs ping, int failures = 0) {
++  ServerHealth h;
++  h.name = name;
++  h.last_ping = ping;
++  h.consecutive_failures = failures;
++  h.probed = true;
++  return h;
++}
++
++/* ------------------------------ fake world ------------------------------ */
++
++struct World {
++  std::mutex mu;
++  std::vector<PingMs> pings;
++  std::vector<bool> connectable;
++  std::vector<std::size_t> connect_log;
++  bool tunnel_down = false;
++  int miss_once = -1;  // this server misses exactly one probe
++  int probes = 0;
++
++  std::vector<std::size_t> Log() {
++    const std::lock_guard<std::mutex> l(mu);
++    return connect_log;
++  }
++  void Set(std::size_t i, PingMs p) {
++    const std::lock_guard<std::mutex> l(mu);
++    pings[i] = p;
++  }
++  void SetDown(bool v) {
++    const std::lock_guard<std::mutex> l(mu);
++    tunnel_down = v;
++  }
++};
++
++static FailoverController::Hooks MakeHooks(World& w) {
++  FailoverController::Hooks hooks;
++  hooks.probe_all = [&w]() {
++    const std::lock_guard<std::mutex> l(w.mu);
++    ++w.probes;
++    auto result = w.pings;
++    if (w.miss_once >= 0) {
++      result[static_cast<std::size_t>(w.miss_once)] = std::nullopt;
++      w.miss_once = -1;
++    }
++    return result;
++  };
++  hooks.connect = [&w](std::size_t i) {
++    const std::lock_guard<std::mutex> l(w.mu);
++    w.connect_log.push_back(i);
++    if (!w.connectable[i]) return false;
++    w.tunnel_down = false;  // a fresh tunnel is healthy
++    return true;
++  };
++  hooks.tunnel_down = [&w]() {
++    const std::lock_guard<std::mutex> l(w.mu);
++    return w.tunnel_down;
++  };
++  return hooks;
++}
++
++static FailoverController::Options FastOptions() {
++  FailoverController::Options o;
++  o.scan_interval = 120ms;
++  o.confirm_delay = 40ms;
++  o.down_grace = 100ms;
++  o.min_switch_gap = 30ms;
++  o.tick = 10ms;
++  return o;
++}
++
++static std::vector<std::string> Names(std::size_t n) {
++  std::vector<std::string> v;
++  for (std::size_t i = 0; i < n; ++i) v.push_back("S" + std::to_string(i));
++  return v;
++}
++
++int main() {
++  setvbuf(stdout, nullptr, _IONBF, 0);
++  const SwitchPolicy p;  // defaults: ratio 1.5, margin 150 ms, 2 misses
++
++  std::puts("[1] Decide(): when to leave the active server");
++  {
++    auto d = Decide(p, {H("a", 100), H("b", 100)}, 0, false);
++    CHECK(!d.do_switch, "equal servers: stay");
++    d = Decide(p, {H("a", 100), H("b", 40)}, 0, false);
++    CHECK(!d.do_switch, "100 ms vs 40 ms (diff 60 < 150): stay");
++    d = Decide(p, {H("a", 200), H("b", 100)}, 0, false);
++    CHECK(!d.do_switch, "200 vs 100 (ratio 2 but diff 100 < 150): stay");
++    d = Decide(p, {H("a", 400), H("b", 280)}, 0, false);
++    CHECK(!d.do_switch, "400 vs 280 (diff 120, ratio 1.43): stay");
++    d = Decide(p, {H("a", 400), H("b", 100)}, 0, false);
++    CHECK(d.do_switch && d.target == 1, "400 vs 100: switch to the better one");
++    d = Decide(p, {H("a", std::nullopt, 1), H("b", 100)}, 0, false);
++    CHECK(!d.do_switch, "ONE missed probe is not a verdict: stay");
++    d = Decide(p, {H("a", std::nullopt, 2), H("b", 100)}, 0, false);
++    CHECK(d.do_switch && d.target == 1, "two missed probes: switch");
++    d = Decide(p, {H("a", 50), H("b", 60)}, 0, true);
++    CHECK(d.do_switch && d.target == 1, "tunnel down: switch even if probes ok");
++    d = Decide(p, {H("a", std::nullopt, 5), H("b", std::nullopt, 5)}, 0, false);
++    CHECK(!d.do_switch, "everything dead: nowhere to go, stay");
++    d = Decide(p, {H("a", std::nullopt, 2), H("b", 90), H("c", 30)}, 0, false);
++    CHECK(d.do_switch && d.target == 2, "dead server: pick the FASTEST other");
++    d = Decide(p, {H("a", 10), H("b", 20)}, std::nullopt, false);
++    CHECK(d.do_switch && d.target == 0, "no active server: pick the best");
++  }
++
++  std::puts("[2] ConnectOrder()");
++  {
++    auto order = ConnectOrder(
++        {H("a", 80), H("b", 40), H("c", std::nullopt), H("d", 60)}, std::nullopt);
++    CHECK((order == std::vector<std::size_t>{1, 3, 0, 2}),
++        "answering servers by ping, silent ones last");
++    order = ConnectOrder(
++        {H("a", 80), H("b", 40), H("c", std::nullopt)}, std::size_t{0});
++    CHECK((order == std::vector<std::size_t>{0, 1, 2}),
++        "preferred server goes first");
++    order = ConnectOrder({H("a", 80), H("b", 40), H("c", 50)}, std::nullopt, 1);
++    CHECK((order == std::vector<std::size_t>{2, 0}), "skip leaves one out");
++  }
++
++  std::puts("[3] controller: initial connection");
++  {
++    World w;
++    w.pings = {80, 40, std::nullopt};
++    w.connectable = {true, true, true};
++    FailoverController c(Names(3), FastOptions(), MakeHooks(w));
++    CHECK(c.Start() && c.Active() == 1, "connects to the fastest server");
++    CHECK((w.Log() == std::vector<std::size_t>{1}), "only one connect call");
++  }
++  {
++    World w;
++    w.pings = {80, 40, std::nullopt};
++    w.connectable = {true, true, true};
++    FailoverController c(Names(3), FastOptions(), MakeHooks(w));
++    CHECK(c.Start(std::size_t{0}) && c.Active() == 0, "user's choice wins");
++  }
++  {
++    World w;
++    w.pings = {80, 40, std::nullopt};
++    w.connectable = {true, false, true};
++    FailoverController c(Names(3), FastOptions(), MakeHooks(w));
++    CHECK(c.Start() && c.Active() == 0, "fastest not usable: next one");
++    CHECK((w.Log() == std::vector<std::size_t>{1, 0}), "tried 1 then 0");
++  }
++  {
++    World w;
++    w.pings = {80, 40};
++    w.connectable = {false, false};
++    FailoverController c(Names(2), FastOptions(), MakeHooks(w));
++    CHECK(!c.Start(), "no server usable: Start() reports failure");
++  }
++
++  std::puts("[4] controller: periodic scan failover");
++  {
++    World w;
++    w.pings = {80, 40, 90};
++    w.connectable = {true, true, true};
++    FailoverController c(Names(3), FastOptions(), MakeHooks(w));
++    c.Start();
++    w.Set(1, std::nullopt);  // the active server dies
++    CHECK(WaitFor([&] { return c.Active() == 0; }, 3000),
++        "dead active server -> moves to the best remaining one");
++    CHECK((w.Log() == std::vector<std::size_t>{1, 0}), "exactly one switch");
++  }
++  {
++    World w;
++    w.pings = {80, 40, 90};
++    w.connectable = {true, true, true};
++    FailoverController c(Names(3), FastOptions(), MakeHooks(w));
++    c.Start();
++    {
++      const std::lock_guard<std::mutex> l(w.mu);
++      w.miss_once = 1;  // one lost probe only
++    }
++    std::this_thread::sleep_for(900ms);
++    CHECK(c.Active() == 1 && w.Log().size() == 1,
++        "a single lost probe does not cause a switch");
++  }
++  {
++    World w;
++    w.pings = {400, 100};
++    w.connectable = {true, true};
++    FailoverController c(Names(2), FastOptions(), MakeHooks(w));
++    c.Start(std::size_t{0});
++    CHECK(WaitFor([&] { return c.Active() == 1; }, 3000),
++        "high ping on the active server -> moves to the better one");
++  }
++  {
++    World w;
++    w.pings = {120, 100};
++    w.connectable = {true, true};
++    FailoverController c(Names(2), FastOptions(), MakeHooks(w));
++    c.Start(std::size_t{0});
++    const int before = [&] { const std::lock_guard<std::mutex> l(w.mu); return w.probes; }();
++    std::this_thread::sleep_for(900ms);
++    const int after = [&] { const std::lock_guard<std::mutex> l(w.mu); return w.probes; }();
++    CHECK(after - before >= 4, "several scans really happened");
++    CHECK(w.Log().size() == 1, "small ping difference: no flapping");
++  }
++  {
++    World w;
++    w.pings = {80, 40};
++    w.connectable = {true, true};
++    FailoverController c(Names(2), FastOptions(), MakeHooks(w));
++    c.Start(std::size_t{0});  // active = 0 (80 ms); then 1 gets slow too
++    w.Set(0, std::nullopt);
++    w.Set(1, std::nullopt);
++    std::this_thread::sleep_for(900ms);
++    CHECK(c.Active() == 0 && w.Log().size() == 1,
++        "everything dead: do not hop around, stay put");
++  }
++
++  std::puts("[5] controller: lost tunnel");
++  {
++    World w;
++    w.pings = {50, 60, 70};
++    w.connectable = {true, true, true};
++    FailoverController c(Names(3), FastOptions(), MakeHooks(w));
++    c.Start();
++    CHECK(c.Active() == 0, "started on the best");
++    w.SetDown(true);  // the tunnel reports a lost connection
++    CHECK(WaitFor([&] { return c.Active() == 1; }, 3000),
++        "tunnel stays down past the grace period -> switch to next best");
++    CHECK((w.Log() == std::vector<std::size_t>{0, 1}), "one switch only");
++  }
++  {
++    World w;
++    w.pings = {50, 60};
++    w.connectable = {true, true};
++    FailoverController c(Names(2), FastOptions(), MakeHooks(w));
++    c.Start();
++    w.SetDown(true);
++    std::this_thread::sleep_for(40ms);
++    w.SetDown(false);  // it recovered by itself within the grace period
++    std::this_thread::sleep_for(600ms);
++    CHECK(c.Active() == 0 && w.Log().size() == 1,
++        "short outage that heals itself: no switch");
++  }
++  {
++    World w;
++    w.pings = {50, 60, 70};
++    w.connectable = {true, false, true};  // next best cannot be connected
++    FailoverController c(Names(3), FastOptions(), MakeHooks(w));
++    c.Start();
++    w.SetDown(true);
++    CHECK(WaitFor([&] { return c.Active() == 2; }, 3000),
++        "next best unusable -> tries the one after it");
++  }
++
++  std::puts("[6] controller: switches off / edge cases");
++  {
++    World w;
++    w.pings = {400, 40};
++    w.connectable = {true, true};
++    auto o = FastOptions();
++    o.failover = false;
++    FailoverController c(Names(2), o, MakeHooks(w));
++    c.Start(std::size_t{0});
++    w.SetDown(true);
++    std::this_thread::sleep_for(600ms);
++    CHECK(c.Active() == 0 && w.Log().size() == 1, "failover=false: never switches");
++  }
++  {
++    World w;
++    w.pings = {50};
++    w.connectable = {true};
++    FailoverController c(Names(1), FastOptions(), MakeHooks(w));
++    CHECK(c.Start() && c.Active() == 0, "single server works");
++    w.SetDown(true);
++    std::this_thread::sleep_for(300ms);
++    CHECK(w.Log().size() == 1, "single server: nothing to switch to");
++  }
++  {
++    World w;
++    w.pings = {50, 60};
++    w.connectable = {true, true};
++    auto o = FastOptions();
++    o.tick = 1000ms;  // long tick: Stop() must still be immediate
++    FailoverController c(Names(2), o, MakeHooks(w));
++    c.Start();
++    const auto t0 = std::chrono::steady_clock::now();
++    c.Stop();
++    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++        std::chrono::steady_clock::now() - t0).count();
++    CHECK(ms < 500, "Stop() does not wait for the next tick");
++  }
++
++  std::printf("\n%s\n", g_fail ? "FAILED" : "ALL PASSED");
++  return g_fail ? 1 : 0;
++}
 diff --git a/src/fptn-vless/test/loopback_test.cpp b/src/fptn-vless/test/loopback_test.cpp
 new file mode 100644
-index 0000000..d516bec
+index 0000000..4944185
 --- /dev/null
 +++ b/src/fptn-vless/test/loopback_test.cpp
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,252 @@
 +// End-to-end test: VLESS client -> VlessServer -> UserspaceStack(lwIP) -> framed
 +// IP packets over pipes -> echo_peer (second lwIP) and back. No fptn deps.
 +#include <signal.h>
@@ -1078,6 +2032,43 @@ index 0000000..d516bec
 +    CHECK(ec, "closed remote port -> connection closed");
 +  }
 +
++  std::puts("[6] tunnel replaced by one to another server (failover)");
++  {
++    auto s = Dial(cio);
++    auto h = Header(g_uuid, 1, To10_0_0_2(), 7);
++    h.insert(h.end(), {'a', 'b'});
++    asio::write(s, asio::buffer(h));
++    uint8_t resp[4];
++    asio::read(s, asio::buffer(resp), ec);
++    CHECK(!ec && std::memcmp(resp + 2, "ab", 2) == 0, "established connection works");
++    auto t0 = std::chrono::steady_clock::now();
++    stack.ResetForNewTunnel("");  // what the failover does when it switches servers
++    uint8_t b[1];
++    s.read_some(asio::buffer(b), ec);
++    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++    CHECK(ec && sec < 1.0, "open connection is dropped at once (client can reconnect)");
++  }
++  {
++    auto s = Dial(cio);  // target that never answers: would wait for the 3 s timeout
++    asio::write(s, asio::buffer(Header(g_uuid, 1, {10, 0, 0, 99}, 80)));
++    std::this_thread::sleep_for(std::chrono::milliseconds(300));
++    auto t0 = std::chrono::steady_clock::now();
++    stack.ResetForNewTunnel("");
++    uint8_t b[1];
++    s.read_some(asio::buffer(b), ec);
++    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++    CHECK(ec && sec < 1.0, "half-open connection is dropped at once, not after the timeout");
++  }
++  {
++    auto s = Dial(cio);
++    auto h = Header(g_uuid, 1, To10_0_0_2(), 7);
++    h.insert(h.end(), {'o', 'k'});
++    asio::write(s, asio::buffer(h));
++    uint8_t resp[4];
++    asio::read(s, asio::buffer(resp), ec);
++    CHECK(!ec && std::memcmp(resp + 2, "ok", 2) == 0, "new connections work after the reset");
++  }
++
 +  std::printf("\n%s  (stack drops in/out: %llu/%llu)\n", g_fail ? "FAILED" : "ALL PASSED",
 +      (unsigned long long)stack.DroppedIn(), (unsigned long long)stack.DroppedOut());
 +
@@ -1087,12 +2078,268 @@ index 0000000..d516bec
 +  stack.Stop();
 +  return g_fail ? 1 : 0;
 +}
+diff --git a/src/fptn-vless/tunnel_manager.cpp b/src/fptn-vless/tunnel_manager.cpp
+new file mode 100644
+index 0000000..96f55e6
+--- /dev/null
++++ b/src/fptn-vless/tunnel_manager.cpp
+@@ -0,0 +1,174 @@
++#include "fptn-vless/tunnel_manager.h"
++
++#include <algorithm>
++#include <condition_variable>
++#include <cstdint>
++#include <memory>
++#include <thread>
++#include <utility>
++
++#include <spdlog/spdlog.h>  // NOLINT(build/include_order)
++
++#include "common/network/ip_address.h"
++#include "common/network/net_interface.h"
++#include "fptn-client/utils/speed_estimator/speed_estimator.h"
++#include "fptn-protocol-lib/https/connection_config.h"
++#include "fptn-vless/userspace_stack.h"
++#include "routing/route_manager.h"  // ResolveDomain only
++#include "vpn/http/client.h"
++
++namespace fptn::vless {
++
++using fptn::utils::speed_estimator::ServerInfo;
++
++TunnelManager::TunnelManager(
++    const fptn::config::ConfigFile& config, Options options)
++    : servers_(config.GetServers()),
++      default_username_(config.GetUsername()),
++      default_password_(config.GetPassword()),
++      options_(std::move(options)) {}
++
++TunnelManager::~TunnelManager() { Shutdown(); }
++
++std::vector<PingMs> TunnelManager::ProbeAll() {
++  struct State {
++    std::mutex mu;
++    std::condition_variable cv;
++    std::vector<PingMs> results;
++    std::size_t done = 0;
++  };
++  auto state = std::make_shared<State>();
++  state->results.resize(servers_.size());
++
++  for (std::size_t i = 0; i < servers_.size(); ++i) {
++    // Detached on purpose (like FPTN's own speed estimator): a probe that
++    // hangs must not hold up the others, its late answer is simply ignored.
++    // NOLINTNEXTLINE(bugprone-exception-escape)
++    std::thread([state, i, server = servers_[i], sni = options_.sni,
++                    timeout = options_.probe_timeout_sec,
++                    strategy = options_.censorship_strategy]() {
++      PingMs ping;
++      try {
++        const std::uint64_t ms = fptn::utils::speed_estimator::GetDownloadTimeMs(
++            server, sni, timeout, server.md5_fingerprint, strategy);
++        if (ms != UINT64_MAX) {  // GetDownloadTimeMs' "no answer" marker
++          ping = static_cast<std::uint32_t>(
++              std::min<std::uint64_t>(ms, UINT32_MAX));
++        }
++      } catch (...) {  // NOLINT
++      }
++      {
++        const std::lock_guard<std::mutex> lock(state->mu);
++        state->results[i] = ping;
++        ++state->done;
++      }
++      state->cv.notify_all();
++    }).detach();
++  }
++
++  std::unique_lock<std::mutex> lock(state->mu);
++  state->cv.wait_for(
++      lock, std::chrono::seconds(options_.probe_timeout_sec + 2),
++      [&state, this]() { return state->done == servers_.size(); });
++  return state->results;
++}
++
++bool TunnelManager::Connect(std::size_t index) {
++  if (index >= servers_.size()) {
++    return false;
++  }
++  const ServerInfo& server = servers_[index];
++  try {
++    const auto server_ip = fptn::routing::ResolveDomain(server.host);
++    if (server_ip.IsEmpty()) {
++      SPDLOG_WARN("DNS resolve error: {}", server.host);
++      return false;
++    }
++    const auto tun_ipv4 = fptn::common::network::IPv4Address::Create(
++        FPTN_CLIENT_DEFAULT_ADDRESS_IP4);
++    const auto tun_ipv6 = fptn::common::network::IPv6Address::Create(
++        FPTN_CLIENT_DEFAULT_ADDRESS_IP6);
++
++    // 1. Log in to the NEW server while the old tunnel keeps working.
++    auto http_client = std::make_unique<fptn::vpn::http::Client>(
++        fptn::protocol::https::ConnectionConfig{
++            .common ={
++                    .server_ip = server_ip,
++                    .server_port = static_cast<std::uint16_t>(server.port),
++                    .sni = options_.sni,
++                    .md5_fingerprint = server.md5_fingerprint,
++                    .client_version = FPTN_VERSION,
++                    .censorship_strategy = options_.censorship_strategy,
++                    .tun_interface_address_ipv4 = tun_ipv4,
++                    .tun_interface_address_ipv6 = tun_ipv6,
++                }},
++        options_.connection_strategy);
++    const std::string& username =
++        server.username.empty() ? default_username_ : server.username;
++    const std::string& password =
++        server.password.empty() ? default_password_ : server.password;
++    if (!http_client->Login(username, password)) {
++      SPDLOG_WARN("Login to '{}' failed (code {}): {}", server.name,
++          http_client->LatestErrorCode(), http_client->LatestError());
++      return false;
++    }
++    const auto [dns_ipv4, dns_ipv6] = http_client->GetDns();
++    if (dns_ipv4.IsEmpty()) {
++      SPDLOG_WARN("Server '{}' did not provide a DNS address", server.name);
++      return false;
++    }
++
++    // 2. The new one is ready: replace the old tunnel. Two tunnels must never
++    // run at once, they would fight over the packets of the userspace stack.
++    const std::lock_guard<std::mutex> lock(mu_);
++    if (vpn_) {
++      vpn_->Stop();
++      vpn_.reset();
++    }
++    // The old server knows nothing about our open connections.
++    UserspaceStack::Instance().ResetForNewTunnel(dns_ipv4.ToString());
++
++    auto virtual_network_interface =
++        std::make_shared<fptn::common::network::TunInterface>(
++            fptn::common::network::TunInterface::Config{
++                .name = "fptn-userspace",
++                .mtu_size = options_.mtu_size,
++                .using_rate_calculator = false,
++                .ipv4_addr = tun_ipv4,
++                .ipv4_netmask = 32,
++                .ipv6_addr = tun_ipv6,
++                .ipv6_netmask = 126});
++    // No route manager, no plugins: nothing is changed on this machine.
++    auto vpn = std::make_unique<fptn::vpn::VpnManager>(
++        fptn::vpn::VpnManager::Config{.http_client = std::move(http_client),
++            .route_manager = nullptr,
++            .virtual_net_interface = virtual_network_interface,
++            .plugins = {}});
++    if (!vpn->Start()) {
++      SPDLOG_ERROR("Cannot start the FPTN connection to '{}'", server.name);
++      return false;  // IsDown() is now true; the controller will move on
++    }
++    vpn_ = std::move(vpn);
++    return true;
++  } catch (const std::exception& ex) {
++    SPDLOG_WARN("Connecting to '{}' failed: {}", server.name, ex.what());
++  } catch (...) {
++    SPDLOG_WARN("Connecting to '{}' failed", server.name);
++  }
++  return false;
++}
++
++bool TunnelManager::IsDown() const {
++  const std::lock_guard<std::mutex> lock(mu_);
++  return !vpn_ || vpn_->IsReconnecting() || !vpn_->IsStarted();
++}
++
++void TunnelManager::Shutdown() {
++  const std::lock_guard<std::mutex> lock(mu_);
++  if (vpn_) {
++    vpn_->Stop();
++    vpn_.reset();
++  }
++}
++
++}  // namespace fptn::vless
+diff --git a/src/fptn-vless/tunnel_manager.h b/src/fptn-vless/tunnel_manager.h
+new file mode 100644
+index 0000000..6804a2e
+--- /dev/null
++++ b/src/fptn-vless/tunnel_manager.h
+@@ -0,0 +1,70 @@
++#pragma once
++
++/*
++ * The FPTN-specific half of multi-server support: probes servers, logs in,
++ * and swaps the live tunnel. The policy that decides WHEN to do that lives in
++ * failover.h and knows nothing about FPTN.
++ */
++
++#include <cstddef>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#include "config/config_file.h"
++#include "fptn-protocol-lib/connection/strategies/base_strategy_connection.h"
++#include "fptn-protocol-lib/https/censorship_strategy.h"
++#include "fptn-vless/failover.h"
++#include "vpn/vpn_manager.h"
++
++namespace fptn::vless {
++
++class TunnelManager {
++ public:
++  struct Options {
++    std::string sni;
++    fptn::protocol::https::CensorshipStrategy censorship_strategy;
++    fptn::protocol::connection::strategies::ConnectionStrategy
++        connection_strategy;
++    int mtu_size = 1420;
++    int probe_timeout_sec = 8;
++  };
++
++  TunnelManager(const fptn::config::ConfigFile& config, Options options);
++  ~TunnelManager();
++  TunnelManager(const TunnelManager&) = delete;
++  TunnelManager& operator=(const TunnelManager&) = delete;
++
++  [[nodiscard]] const std::vector<fptn::utils::speed_estimator::ServerInfo>&
++  Servers() const noexcept {
++    return servers_;
++  }
++
++  // Response time of every server (all at once). Uses the same unauthenticated
++  // 100 KB test download FPTN uses to rank servers, through the configured
++  // bypass method, so a blocked server shows up as "no response". It does not
++  // log in, so it cannot disturb the current session.
++  std::vector<PingMs> ProbeAll();
++
++  // Makes server `index` the active one. The new connection is logged in
++  // first; only then the old tunnel is replaced. False = the old tunnel is
++  // left untouched.
++  bool Connect(std::size_t index);
++
++  // The live tunnel lost its connection (or there is none).
++  [[nodiscard]] bool IsDown() const;
++
++  void Shutdown();
++
++ private:
++  const std::vector<fptn::utils::speed_estimator::ServerInfo> servers_;
++  const std::string default_username_;
++  const std::string default_password_;
++  const Options options_;
++
++  mutable std::mutex mu_;
++  std::unique_ptr<fptn::vpn::VpnManager> vpn_;
++};
++
++}  // namespace fptn::vless
 diff --git a/src/fptn-vless/userspace_stack.cpp b/src/fptn-vless/userspace_stack.cpp
 new file mode 100644
-index 0000000..21cfd7e
+index 0000000..676cf50
 --- /dev/null
 +++ b/src/fptn-vless/userspace_stack.cpp
-@@ -0,0 +1,456 @@
+@@ -0,0 +1,515 @@
 +#include "fptn-vless/userspace_stack.h"
 +
 +#include <algorithm>
@@ -1309,6 +2556,44 @@ index 0000000..21cfd7e
 +    }
 +  }
 +
++  // Drops every flow at once; the tunnel they ran through is gone.
++  static void AbortAll(UserspaceStack& stack) {
++    const std::vector<TcpFlowPtr> flows(
++        stack.flows_.begin(), stack.flows_.end());
++    stack.flows_.clear();
++    for (const auto& flow : flows) {
++      auto cb = std::move(flow->cb_);
++      flow->cb_ = {};
++      flow->accepted_ = nullptr;
++      if (flow->pcb_ != nullptr) {
++        tcp_pcb* pcb = flow->pcb_;
++        flow->pcb_ = nullptr;
++        tcp_arg(pcb, nullptr);
++        tcp_recv(pcb, nullptr);
++        tcp_sent(pcb, nullptr);
++        tcp_err(pcb, nullptr);
++        tcp_abort(pcb);
++      }
++      if (flow->connected_) {
++        if (cb.on_error) {
++          cb.on_error();
++        }
++      } else if (cb.on_connected) {
++        cb.on_connected(false);
++      }
++    }
++    // Forget everything meant for the old tunnel, including the RST packets
++    // that tcp_abort() has just generated.
++    {
++      const std::lock_guard<std::mutex> lock(stack.out_mu_);
++      stack.out_q_.clear();
++    }
++    {
++      const std::lock_guard<std::mutex> lock(stack.mu_);
++      stack.in_q_.clear();
++    }
++  }
++
 +  static void CloseFlow(const TcpFlowPtr& flow, bool abort) {
 +    flow->cb_ = {};
 +    flow->accepted_ = nullptr;
@@ -1435,6 +2720,27 @@ index 0000000..21cfd7e
 +  cv_.notify_one();
 +}
 +
++void UserspaceStack::ResetForNewTunnel(const std::string& dns_ipv4) {
++  if (!running_) {
++    return;
++  }
++  auto done = std::make_shared<std::promise<void>>();
++  auto finished = done->get_future();
++  Post([this, dns_ipv4, done]() {
++    LwipGlue::AbortAll(*this);
++    if (!dns_ipv4.empty()) {
++      ip_addr_t dns;
++      if (ip4addr_aton(dns_ipv4.c_str(), ip_2_ip4(&dns))) {
++        dns_setserver(0, &dns);
++      } else {
++        SPDLOG_WARN("userspace stack: bad DNS address '{}'", dns_ipv4);
++      }
++    }
++    done->set_value();
++  });
++  finished.wait_for(std::chrono::seconds(3));
++}
++
 +void UserspaceStack::Input(const std::uint8_t* data, std::size_t size) {
 +  if (data == nullptr || size == 0 || size > 0xFFFF) {
 +    return;
@@ -1551,10 +2857,10 @@ index 0000000..21cfd7e
 +}  // namespace fptn::vless
 diff --git a/src/fptn-vless/userspace_stack.h b/src/fptn-vless/userspace_stack.h
 new file mode 100644
-index 0000000..43a1d7b
+index 0000000..abe5bb7
 --- /dev/null
 +++ b/src/fptn-vless/userspace_stack.h
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,149 @@
 +#pragma once
 +
 +/*
@@ -1668,6 +2974,13 @@ index 0000000..43a1d7b
 +
 +  void Post(std::function<void()> fn);
 +
++  // Called when the tunnel is replaced by one to ANOTHER server (the old
++  // server knows nothing about our open connections): resets every
++  // connection so VLESS clients reconnect at once instead of hanging, forgets
++  // packets queued for the old tunnel and switches the DNS server.
++  // Blocks until done (a few ms).
++  void ResetForNewTunnel(const std::string& dns_ipv4);
++
 +  std::uint64_t DroppedIn() const { return dropped_in_; }
 +  std::uint64_t DroppedOut() const { return dropped_out_; }
 +
@@ -1763,10 +3076,10 @@ index 0000000..0257159
 +}  // namespace fptn::common::network
 diff --git a/src/fptn-vless/vless_server.cpp b/src/fptn-vless/vless_server.cpp
 new file mode 100644
-index 0000000..e2beaae
+index 0000000..1a56409
 --- /dev/null
 +++ b/src/fptn-vless/vless_server.cpp
-@@ -0,0 +1,422 @@
+@@ -0,0 +1,430 @@
 +#include "fptn-vless/vless_server.h"
 +
 +#include <cstdio>
@@ -2180,6 +3493,14 @@ index 0000000..e2beaae
 +        if (!ec) {
 +          boost::system::error_code ignored;
 +          socket.set_option(tcp::no_delay(true), ignored);
++          {
++            const auto peer = socket.remote_endpoint(ignored);
++            if (!ignored &&
++                seen_clients_.insert(peer.address().to_string()).second) {
++              SPDLOG_INFO("New VLESS client connected from {}",
++                  peer.address().to_string());
++            }
++          }
 +          std::make_shared<VlessSession>(ioc_, std::move(socket), config_,
 +              stack_)
 +              ->Start();
@@ -2191,10 +3512,10 @@ index 0000000..e2beaae
 +}  // namespace fptn::vless
 diff --git a/src/fptn-vless/vless_server.h b/src/fptn-vless/vless_server.h
 new file mode 100644
-index 0000000..8d865c5
+index 0000000..6ddd28a
 --- /dev/null
 +++ b/src/fptn-vless/vless_server.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,62 @@
 +#pragma once
 +
 +/*
@@ -2213,7 +3534,9 @@ index 0000000..8d865c5
 +#include <array>
 +#include <cstdint>
 +#include <memory>
++
 +#include <string>
++#include <unordered_set>
 +
 +#include <boost/asio.hpp>
 +
@@ -2251,6 +3574,7 @@ index 0000000..8d865c5
 +  Config config_;
 +  UserspaceStack& stack_;
 +  boost::asio::ip::tcp::acceptor acceptor_;
++  std::unordered_set<std::string> seen_clients_;  // accept handler only
 +};
 +
 +}  // namespace fptn::vless
