@@ -2,7 +2,7 @@
 
 **Форк-надстройка над [FPTN](https://github.com/fptn-project/fptn) (MIT):** подключается к серверам FPTN по обычному токену и отдаёт туннель в локальную сеть как **VLESS-inbound**. Ничего не ставится в систему: ни сетевого адаптера, ни маршрутов, ни изменений DNS.
 
-> English summary: `fptn-vless.exe` is a Windows build of the FPTN client that, instead of creating a Wintun adapter, terminates the tunnel in a userspace lwIP stack and exposes it to the LAN as a plain VLESS inbound (TCP). Phones and other PCs connect with any VLESS client. It adds a one-page web control panel, a tray icon, ping-based multi-server selection and failover. Upstream changes are ~25 lines in 3 files; everything else lives in `src/fptn-vless/`. Details below (in Russian).
+> English summary: `fptn-vless.exe` is an unofficial Windows build of the FPTN client that, instead of creating a Wintun adapter, terminates the tunnel in a userspace lwIP stack and exposes it to the LAN as a plain VLESS inbound (TCP). Phones and other PCs connect with any VLESS client. It adds a one-page web control panel, a tray icon, ping-based multi-server selection and failover. It adds no obfuscation or SNI spoofing of its own: the server connection is the unmodified FPTN library. Upstream changes are ~25 lines in 3 files; everything else lives in `src/fptn-vless/`. Details below (in Russian).
 
 ![Панель управления](https://raw.githubusercontent.com/belka-developer/media-readme/main/fptn-to-vless/panel-best.png)
 
@@ -21,7 +21,7 @@
 
 ## Как это работает
 
-1. **Токен.** Тот же токен доступа, что у официального клиента (`fptnb:…`). Разбор, вход в API и WebSocket-туннель с обходом блокировок (подмена SNI и т. д.) выполняет штатная библиотека FPTN, исходники клиента не переписаны.
+1. **Токен.** Тот же токен доступа, что у официального клиента (`fptnb:…`). Разбор, вход в API и туннель до сервера выполняет штатная библиотека FPTN, исходники клиента не переписаны.
 2. **Подмена TUN-устройства.** В upstream `TunInterface` на Windows это Wintun. При сборке с `FPTN_USERSPACE_TUN` вместо него подставляется `UserspaceTunDevice`: IP-пакеты библиотеки FPTN попадают в lwIP, работающий в отдельном потоке. `route_manager` в `VpnManager` сделан необязательным (nullptr), поэтому маршруты не трогаются.
 3. **VLESS-inbound.** Минимальная реализация: TCP, цели IPv4 или домен, аутентификация по UUID (по умолчанию выводится из токена, можно задать `--uuid`). Каждое VLESS-соединение превращается в TCP-соединение в lwIP, а домены резолвятся внутри туннеля через DNS сервера FPTN (с публичным запасным резолвером).
 4. **Выбор сервера и failover.** Программа замеряет отклик всех серверов из токена, подключается к лучшему и раз в 5 минут перемеряет. Переключение с гистерезисом (медленнее лучшего в 1,5 раза **и** минимум на 150 мс, подтверждение повторным замером), новое соединение поднимается до закрытия старого. Ссылка и UUID при смене сервера не меняются.
@@ -55,6 +55,19 @@
 5. Дальше достаточно ярлыка: он открывает панель, а если программа не запущена, запускает её и сам подключается к сохранённому серверу.
 
 Параметры командной строки нужны только для особых случаев: `--access-token`, `--token-file`, `--server`, `--port`, `--dashboard-port`, `--link-host`, `--no-failover`, `--scan-interval`, `--no-tray`, `--no-shortcut`, `--no-browser`, `--verbose`. Подробности и таблица параметров лежат в `src/fptn-vless/README.md` внутри патча.
+
+## Что проект НЕ делает
+
+`fptn-vless` не добавляет **собственной** обфускации, маскировки трафика или подмены SNI. Это только удобное подключение по токену и раздача туннеля в локальную сеть. Всё, что касается соединения с сервером (протокол, шифрование, поведение при блокировках), делает неизменённая библиотека FPTN, и её возможности ограничены тем, что умеет официальный клиент. В панели настроек обхода нет; параметры `--sni`, `--bypass-method`, `--connection-strategy` передаются в библиотеку как есть и нужны только для особых случаев.
+
+Если вам нужна маскировка и обход блокировок, смотрите официальный проект и его рекомендации (ссылки ниже).
+
+## Ссылки
+
+* Официальный проект FPTN: [github.com/fptn-project/fptn](https://github.com/fptn-project/fptn?tab=readme-ov-file)
+* Telegram-бот администраторов FPTN (получение токена): [@fptn_bot](https://t.me/fptn_bot)
+* Telegram-канал FPTN: [t.me/fptn_project](https://t.me/fptn_project)
+* Мой Telegram-канал: [t.me/belka_link](https://t.me/belka_link)
 
 ## Что изменено относительно upstream
 
@@ -90,4 +103,4 @@ Actions → «Build fptn-vless.exe» → Run workflow → артефакт fptn-
 
 ## Лицензия и благодарности
 
-Основа: [FPTN](https://github.com/fptn-project/fptn) (MIT), стек [lwIP](https://savannah.nongnu.org/projects/lwip/) (BSD-3). Токены доступа и серверы принадлежат их владельцам; проект не обходит ограничения доступа к серверам.
+Основа: [FPTN](https://github.com/fptn-project/fptn?tab=readme-ov-file) (MIT), стек [lwIP](https://savannah.nongnu.org/projects/lwip/) (BSD-3). Токены доступа и серверы принадлежат их владельцам. Проект неофициальный и не связан с администраторами FPTN.
