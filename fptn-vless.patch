@@ -1,3 +1,99 @@
+diff --git a/.github/workflows/build-fptn-vless-windows.yml b/.github/workflows/build-fptn-vless-windows.yml
+new file mode 100644
+index 0000000..6d63cc1
+--- /dev/null
++++ b/.github/workflows/build-fptn-vless-windows.yml
+@@ -0,0 +1,90 @@
++name: Build fptn-vless (Windows)
++
++# Run it by hand: Actions -> "Build fptn-vless (Windows)" -> Run workflow.
++# The finished fptn-vless.exe is attached to the run as an artifact.
++on:
++  workflow_dispatch:
++
++jobs:
++  build:
++    # Pinned: the commands below assume Visual Studio 2022.
++    runs-on: windows-2022
++    timeout-minutes: 300
++    env:
++      FPTN_VERSION: 0.0.0-vless
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v5
++        with:
++          submodules: true
++          fetch-depth: 0
++
++      - name: Set up Python
++        uses: actions/setup-python@v6
++        with:
++          python-version: "3.13"
++
++      # BoringSSL builds its assembly with NASM on Windows x64 (upstream's
++      # Windows README also requires it on PATH).
++      - name: Install NASM
++        shell: powershell
++        run: |
++          choco install nasm -y --no-progress
++          $dir = "C:\Program Files\NASM"
++          if (-not (Test-Path "$dir\nasm.exe")) { throw "nasm.exe not found in $dir" }
++          Add-Content -Path $env:GITHUB_PATH -Value $dir
++          & "$dir\nasm.exe" -v
++
++      - name: Install Conan
++        shell: powershell
++        run: |
++          pip install conan==2.15.1 requests numpy
++          conan profile detect --force
++
++      # The first build compiles Boost, protobuf, BoringSSL, ... (30-60 min).
++      # Later runs reuse this cache and take a few minutes.
++      - name: Cache Conan packages
++        uses: actions/cache@v5
++        with:
++          path: ~/.conan2
++          key: conan-win-${{ hashFiles('conanfile.py', '.conan/**') }}
++
++      - name: Install dependencies
++        shell: powershell
++        run: |
++          conan install . --output-folder=build --build=missing -o with_gui_client=False --settings build_type=Release -s compiler.cppstd=17
++
++      - name: Show CMake logs of failed dependency builds
++        if: failure()
++        shell: powershell
++        run: |
++          Get-ChildItem -Path "$env:USERPROFILE\.conan2\p\b" -Recurse -Include CMakeError.log,CMakeConfigureLog.yaml -ErrorAction SilentlyContinue | ForEach-Object { "=== $($_.FullName)"; Get-Content $_.FullName -Tail 80 }
++
++      - name: Configure
++        shell: powershell
++        run: |
++          cd build
++          cmake .. -G "Visual Studio 17 2022" -DCMAKE_TOOLCHAIN_FILE="conan_toolchain.cmake" -DCMAKE_BUILD_TYPE=Release
++
++      - name: Build fptn-vless
++        shell: powershell
++        run: |
++          cd build
++          cmake --build . --config Release --target fptn-vless
++
++      - name: Collect
++        shell: powershell
++        run: |
++          New-Item -ItemType Directory -Force -Path dist | Out-Null
++          $exe = Get-ChildItem -Path build -Recurse -Filter fptn-vless.exe | Select-Object -First 1
++          if (-not $exe) { throw "fptn-vless.exe was not produced" }
++          Copy-Item $exe.FullName dist/
++          Copy-Item src/fptn-vless/README.md dist/README.md
++          Get-ChildItem dist
++
++      - name: Upload
++        uses: actions/upload-artifact@v6
++        with:
++          name: fptn-vless-windows-x64
++          path: dist/*
++          if-no-files-found: error
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index 4d414b3..a8f7716 100644
 --- a/CMakeLists.txt
@@ -296,10 +392,10 @@ index 0000000..d99e014
 +endif()
 diff --git a/src/fptn-vless/README.md b/src/fptn-vless/README.md
 new file mode 100644
-index 0000000..034d1c1
+index 0000000..b4dc92f
 --- /dev/null
 +++ b/src/fptn-vless/README.md
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,122 @@
 +# fptn-vless
 +
 +Консольная утилита: подключается к FPTN по токену и отдаёт туннель в локальную
@@ -327,9 +423,19 @@ index 0000000..034d1c1
 +   (или к самому быстрому) и откроет панель.
 +5. Выход: правый щелчок по значку в трее → «Выход» (или Ctrl+C, если запущено из консоли).
 +
-+Из панели доступно всё: ввод/смена токена, выбор и смена сервера, «Отключиться»,
-+повторный замер, проверка туннеля, журнал событий. Адаптеры, маршруты и DNS Windows
-+не затрагиваются.
++Панель умещается на одной странице без прокрутки: слева список серверов (по
++пингу, с цветной шкалой), справа настройки:
++
++* **Режим подключения**: «Лучший по пингу» (программа сама держится на самом быстром
++  сервере) или «Выбранный» (только сервер, на который вы нажали).
++* **Если сервер упал**: «Перейти на другой» или «Ничего не делать».
++* **Порт VLESS**: можно задать свой. Если порт занят, остаётся прежний.
++* **Брандмауэр**: кнопка добавляет правило для входящих подключений на этот порт
++  (спросит UAC). Рядом показано, открыт порт или нет.
++* Ввод/смена токена, «Отключиться», повторный замер, проверка туннеля, журнал.
++
++Настройки (режим, поведение при падении, порт, последний сервер) запоминаются.
++Адаптеры, маршруты и DNS Windows не затрагиваются.
 +
 +Параметры командной строки нужны только для особых случаев (`--access-token`,
 +`--token-file`, `--server`, `--port`, `--dashboard-port`, `--no-tray`, `--no-shortcut`,
@@ -372,11 +478,11 @@ index 0000000..034d1c1
 +* он медленнее лучшего более чем в 1.5 раза **и** минимум на 150 мс (гистерезис).
 +  Перед переключением замер подтверждается повторно через 30 с.
 +
-+Сервер, выбранный вручную (кнопка «Подключиться» или `--server`), «закреплён»:
-+уходит с него программа только при обрыве. Новое соединение сначала поднимается и
++В режиме «Выбранный» (включается и кнопкой «Подключиться» на сервере, и `--server`)
++программа остаётся на нём; при падении уходит только если включено «Перейти на другой». Новое соединение сначала поднимается и
 +только потом заменяет старое; открытые VLESS-соединения при смене сервера
 +обрываются (клиент переподключается сам), ссылка и UUID не меняются.
-+`--no-failover` отключает автопереключение.
++`--no-failover` отключает автопереключение (настройка «Если сервер упал» тогда недоступна).
 +
 +## Что изменено в upstream (всего +19/−5 строк)
 +
@@ -414,10 +520,10 @@ index 0000000..034d1c1
 +сервера. `fptn_vless_failover_test` проверяет логику выбора/переключения серверов, `fptn_vless_dashboard_test` — страницу управления и её защиту (Host и CSRF), `fptn_vless_app_test` — жизненный цикл приложения (токен, сканирование, подключение, смена сервера, запоминание) на подставных серверах.
 diff --git a/src/fptn-vless/app.cpp b/src/fptn-vless/app.cpp
 new file mode 100644
-index 0000000..8e782e8
+index 0000000..80dcf8e
 --- /dev/null
 +++ b/src/fptn-vless/app.cpp
-@@ -0,0 +1,581 @@
+@@ -0,0 +1,825 @@
 +#include "fptn-vless/app.h"
 +
 +#include <algorithm>
@@ -539,6 +645,7 @@ index 0000000..8e782e8
 +    }
 +    finished = std::move(worker_);  // the previous action is done
 +    busy_ = label;
++    notice_.clear();
 +  }
 +  if (finished.joinable()) {
 +    finished.join();
@@ -566,26 +673,34 @@ index 0000000..8e782e8
 +    const std::lock_guard<std::mutex> lock(mu_);
 +    token_saved_ = !saved.token.empty();
 +    remember_ = token_saved_;
++    mode_ = saved.mode;
++    switch_on_failure_ = saved.switch_on_failure;
++    selected_name_ = saved.server;
++    port_ = saved.port > 0 ? saved.port : options_.port;
++    if (!options_.preferred_server.empty()) {  // --server wins
++      mode_ = "selected";
++      selected_name_ = options_.preferred_server;
++    }
 +  }
 +  if (token.empty()) {
 +    SetPhase(Phase::kNoToken);
 +    return;
 +  }
-+  Run("Подключение...", [this, token, saved]() {
++  Run("Подключение...", [this, token]() {
 +    if (!Setup(token)) {
 +      return;
 +    }
-+    // --server wins, then the choice remembered from last time.
-+    const bool explicit_choice = !options_.preferred_server.empty();
-+    const std::string wanted =
-+        explicit_choice ? options_.preferred_server : saved.server;
 +    std::optional<std::size_t> index;
++    std::string wanted;
++    bool selected = false;
 +    std::shared_ptr<ITunnels> tunnels;
 +    {
 +      const std::lock_guard<std::mutex> lock(mu_);
 +      tunnels = tunnels_;
++      wanted = selected_name_;
++      selected = mode_ == "selected";
 +    }
-+    if (!wanted.empty() && (explicit_choice || saved.pinned)) {
++    if (selected && !wanted.empty()) {
 +      const auto names = tunnels->Names();
 +      for (std::size_t i = 0; i < names.size(); ++i) {
 +        if (Lower(names[i]) == Lower(wanted)) {
@@ -646,6 +761,11 @@ index 0000000..8e782e8
 +  hooks.active_works = deps_.carries_traffic;
 +  auto controller = std::make_shared<FailoverController>(
 +      tunnels->Names(), options_.failover, std::move(hooks));
++  {
++    const std::lock_guard<std::mutex> lock(mu_);
++    controller->SetSwitchOnFailure(switch_on_failure_);
++    controller->SetPinned(mode_ == "selected");
++  }
 +  controller->Scan();
 +
 +  Uuid uuid = DeriveUuid(token);
@@ -666,16 +786,18 @@ index 0000000..8e782e8
 +
 +bool App::StartVless() {
 +  Uuid uuid;
++  int port = 0;
 +  {
 +    const std::lock_guard<std::mutex> lock(mu_);
 +    if (vless_) {
 +      return true;
 +    }
 +    uuid = uuid_;
++    port = port_;
 +  }
 +  VlessServer::Config config;
 +  config.listen_address = options_.listen;
-+  config.port = static_cast<std::uint16_t>(options_.port);
++  config.port = static_cast<std::uint16_t>(port);
 +  config.uuid = uuid;
 +  bool ok = false;
 +  std::unique_ptr<VlessServer> server;
@@ -709,7 +831,14 @@ index 0000000..8e782e8
 +    Notify("Не удалось подключиться ни к одному серверу");
 +    return false;
 +  }
-+  controller->SetPinned(index.has_value());
++  {
++    const std::lock_guard<std::mutex> lock(mu_);
++    if (index) {
++      mode_ = "selected";  // the user named a server: stay on it
++    }
++    controller->SetPinned(mode_ == "selected");
++    controller->SetSwitchOnFailure(switch_on_failure_);
++  }
 +  if (!StartVless()) {
 +    controller->Stop();
 +    {
@@ -718,9 +847,13 @@ index 0000000..8e782e8
 +        tunnels_->Shutdown();
 +      }
 +    }
-+    const std::string text =
-+        fmt::format("Порт {} занят или недоступен. Закройте другую копию "
-+                    "программы или смените порт (--port).", options_.port);
++    int port = 0;
++    {
++      const std::lock_guard<std::mutex> lock(mu_);
++      port = port_;
++    }
++    const std::string text = fmt::format(
++        "Порт {} занят или недоступен. Укажите другой порт справа.", port);
 +    SetPhase(Phase::kReady, text);
 +    Notify("{}", text);
 +    return false;
@@ -745,9 +878,14 @@ index 0000000..8e782e8
 +  const auto active = controller->Active();
 +  const auto snapshot = controller->Snapshot();
 +  if (active && *active < snapshot.size()) {
++    {
++      const std::lock_guard<std::mutex> lock(mu_);
++      selected_name_ = snapshot[*active].name;
++    }
 +    Notify("Подключено: {}", snapshot[*active].name);
 +    SaveSettings();
 +  }
++  RefreshFirewall();
 +  if (deps_.full_check) {
 +    const std::string summary = deps_.full_check();
 +    {
@@ -764,21 +902,42 @@ index 0000000..8e782e8
 +  std::shared_ptr<FailoverController> controller;
 +  {
 +    const std::lock_guard<std::mutex> lock(mu_);
-+    if (!remember_) {
-+      return;
++    if (remember_) {
++      settings.token = token_;  // the token only if the user allowed it
 +    }
-+    settings.token = token_;
++    settings.server = selected_name_;
++    settings.mode = mode_;
++    settings.switch_on_failure = switch_on_failure_;
++    settings.port = port_;
 +    controller = controller_;
 +  }
 +  if (controller) {
 +    const auto active = controller->Active();
 +    const auto snapshot = controller->Snapshot();
-+    if (active && *active < snapshot.size()) {
++    if (active && *active < snapshot.size() && settings.mode == "selected") {
 +      settings.server = snapshot[*active].name;
 +    }
-+    settings.pinned = controller->Pinned();
 +  }
 +  store_.Save(settings);
++}
++
++void App::SetNotice(const std::string& text) {
++  const std::lock_guard<std::mutex> lock(mu_);
++  notice_ = text;
++}
++
++void App::RefreshFirewall() {
++  if (!deps_.firewall_status) {
++    return;
++  }
++  int port = 0;
++  {
++    const std::lock_guard<std::mutex> lock(mu_);
++    port = port_;
++  }
++  const FirewallStatus status = deps_.firewall_status(port);
++  const std::lock_guard<std::mutex> lock(mu_);
++  firewall_ = status;
 +}
 +
 +bool App::SubmitToken(const std::string& token, bool remember) {
@@ -795,23 +954,23 @@ index 0000000..8e782e8
 +      remember_ = remember;
 +      token_saved_ = remember;
 +    }
-+    if (remember) {
-+      Settings settings;
-+      settings.token = clean;
-+      store_.Save(settings);
-+    } else {
-+      store_.Clear();
-+    }
++    SaveSettings();
 +  });
 +}
 +
 +bool App::Connect(std::optional<std::size_t> index) {
 +  std::shared_ptr<FailoverController> controller;
++  std::shared_ptr<ITunnels> tunnels;
 +  bool connected = false;
++  std::string mode;
++  std::string wanted;
 +  {
 +    const std::lock_guard<std::mutex> lock(mu_);
 +    controller = controller_;
++    tunnels = tunnels_;
 +    connected = phase_ == Phase::kConnected;
++    mode = mode_;
++    wanted = selected_name_;
 +  }
 +  if (!controller) {
 +    return false;
@@ -822,11 +981,42 @@ index 0000000..8e782e8
 +    }
 +    return Run("Переключение на сервер...", [this, controller, index]() {
 +      if (controller->SwitchTo(*index, true)) {
++        const std::string name = ServerName(*index);
++        {
++          const std::lock_guard<std::mutex> lock(mu_);
++          mode_ = "selected";
++          selected_name_ = name;
++        }
 +        SaveSettings();
++      } else {
++        SetNotice("Не удалось подключиться к выбранному серверу");
 +      }
 +    });
 +  }
++  if (!index && mode == "selected" && !wanted.empty()) {
++    const auto names = tunnels->Names();  // "connect" in the selected mode
++    for (std::size_t i = 0; i < names.size(); ++i) {
++      if (Lower(names[i]) == Lower(wanted)) {
++        index = i;
++      }
++    }
++  }
 +  return Run("Подключение...", [this, index]() { ConnectTo(index); });
++}
++
++std::string App::ServerName(std::size_t index) {
++  std::shared_ptr<FailoverController> controller;
++  {
++    const std::lock_guard<std::mutex> lock(mu_);
++    controller = controller_;
++  }
++  if (controller) {
++    const auto snapshot = controller->Snapshot();
++    if (index < snapshot.size()) {
++      return snapshot[index].name;
++    }
++  }
++  return {};
 +}
 +
 +bool App::Disconnect() {
@@ -875,24 +1065,151 @@ index 0000000..8e782e8
 +  });
 +}
 +
-+bool App::Unpin() {
++bool App::Unpin() { return SetMode("best"); }
++
++bool App::SetMode(const std::string& mode) {
++  if (mode != "best" && mode != "selected") {
++    return false;
++  }
++  std::shared_ptr<FailoverController> controller;
++  bool connected = false;
++  {
++    const std::lock_guard<std::mutex> lock(mu_);
++    mode_ = mode;
++    controller = controller_;
++    connected = phase_ == Phase::kConnected;
++  }
++  if (controller) {
++    controller->SetPinned(mode == "selected");
++  }
++  SaveSettings();
++  if (mode == "best" && connected && controller) {
++    // Do not wait for the next periodic scan: look for a better server now.
++    return Run("Поиск лучшего сервера...", [controller]() {
++      controller->Rebalance();
++    });
++  }
++  return true;
++}
++
++bool App::SetSwitchOnFailure(bool enabled) {
 +  std::shared_ptr<FailoverController> controller;
 +  {
 +    const std::lock_guard<std::mutex> lock(mu_);
++    switch_on_failure_ = enabled;
 +    controller = controller_;
 +  }
-+  if (!controller) {
-+    return false;
++  if (controller) {
++    controller->SetSwitchOnFailure(enabled);
 +  }
-+  controller->SetPinned(false);
 +  SaveSettings();
 +  return true;
++}
++
++bool App::SetPort(int port) {
++  if (port < 1 || port > 65535 || port == options_.reserved_port) {
++    return false;
++  }
++  return Run("Смена порта...", [this, port]() {
++    int old_port = 0;
++    {
++      const std::lock_guard<std::mutex> lock(mu_);
++      old_port = port_;
++    }
++    if (port == old_port) {
++      return;
++    }
++    bool running = false;
++    Uuid uuid;
++    {
++      const std::lock_guard<std::mutex> lock(mu_);
++      running = vless_ != nullptr;
++      uuid = uuid_;
++    }
++    if (running) {
++      // Open the new port first; the old one stays if that fails.
++      VlessServer::Config config;
++      config.listen_address = options_.listen;
++      config.port = static_cast<std::uint16_t>(port);
++      config.uuid = uuid;
++      std::unique_ptr<VlessServer> fresh;
++      bool ok = false;
++      std::unique_ptr<VlessServer> old;
++      {
++        const std::lock_guard<std::mutex> lock(mu_);
++        old = std::move(vless_);
++      }
++      OnIoc([&]() {
++        if (old) {
++          old->Stop();  // free the old port (it may be the same socket range)
++        }
++        fresh = std::make_unique<VlessServer>(ioc_, config, stack_);
++        ok = fresh->Start();
++        if (!ok) {
++          fresh.reset();
++          // go back to the old port
++          VlessServer::Config back = config;
++          back.port = static_cast<std::uint16_t>(old_port);
++          fresh = std::make_unique<VlessServer>(ioc_, back, stack_);
++          if (!fresh->Start()) {
++            fresh.reset();
++          }
++        }
++        old.reset();
++      });
++      {
++        const std::lock_guard<std::mutex> lock(mu_);
++        vless_ = std::move(fresh);
++        if (ok) {
++          port_ = port;
++        }
++      }
++      if (!ok) {
++        SetNotice(fmt::format("Порт {} занят или недоступен, оставлен {}", port,
++            old_port));
++        return;
++      }
++    } else {
++      const std::lock_guard<std::mutex> lock(mu_);
++      port_ = port;
++    }
++    Notify("Порт VLESS: {}", port);
++    SaveSettings();
++    RefreshFirewall();
++  });
++}
++
++bool App::AddFirewallRule() {
++  if (!deps_.firewall_add) {
++    return false;
++  }
++  return Run("Открываю порт в брандмауэре...", [this]() {
++    int port = 0;
++    {
++      const std::lock_guard<std::mutex> lock(mu_);
++      port = port_;
++    }
++    const std::string error = deps_.firewall_add(port);
++    if (!error.empty()) {
++      SetNotice("Брандмауэр: " + error);
++      Notify("Брандмауэр: {}", error);
++    } else {
++      Notify("Порт {} открыт в брандмауэре Windows", port);
++    }
++    RefreshFirewall();
++  });
++}
++
++bool App::CheckFirewall() {
++  if (!deps_.firewall_status) {
++    return false;
++  }
++  return Run("Проверка брандмауэра...", [this]() { RefreshFirewall(); });
 +}
 +
 +bool App::ForgetToken() {
 +  return Run("Забываю токен...", [this]() {
 +    Teardown(true);
-+    store_.Clear();
 +    {
 +      const std::lock_guard<std::mutex> lock(mu_);
 +      token_.clear();
@@ -901,6 +1218,7 @@ index 0000000..8e782e8
 +      hosts_.clear();
 +      last_check_.clear();
 +    }
++    SaveSettings();  // keeps the preferences, drops the token
 +    SetPhase(Phase::kNoToken);
 +    Notify("Токен удалён");
 +  });
@@ -927,6 +1245,31 @@ index 0000000..8e782e8
 +    }
 +    return result(Connect(static_cast<std::size_t>(std::stoul(query.substr(2)))));
 +  }
++  const auto value = [&query]() {
++    return query.rfind("value=", 0) == 0 ? query.substr(6) : std::string();
++  };
++  if (action == "mode") {
++    const std::string v = value();
++    return (v == "best" || v == "selected") ? result(SetMode(v)) : 400;
++  }
++  if (action == "onfail") {
++    const std::string v = value();
++    return (v == "switch" || v == "nothing") ? result(SetSwitchOnFailure(v == "switch")) : 400;
++  }
++  if (action == "port") {
++    const std::string v = value();
++    if (v.empty() || v.size() > 5 ||
++        !std::all_of(v.begin(), v.end(),
++            [](unsigned char c) { return std::isdigit(c) != 0; })) {
++      return 400;
++    }
++    const int port = std::stoi(v);
++    return (port >= 1 && port <= 65535 && port != options_.reserved_port)
++               ? result(SetPort(port))
++               : 400;
++  }
++  if (action == "firewall") return result(AddFirewallRule());
++  if (action == "firewall_check") return result(CheckFirewall());
 +  if (action == "disconnect") return result(Disconnect());
 +  if (action == "rescan") return result(Rescan());
 +  if (action == "check") return result(CheckTunnel());
@@ -949,11 +1292,17 @@ index 0000000..8e782e8
 +    state["check"] = last_check_;
 +    state["token_saved"] = token_saved_;
 +    state["uuid"] = UuidToString(uuid_);
-+    state["port"] = options_.port;
++    state["port"] = port_;
++    state["mode"] = mode_;
++    state["switch_on_failure"] = switch_on_failure_;
++    state["selected"] = selected_name_;
++    state["notice"] = notice_;
++    state["reserved_port"] = options_.reserved_port;
++    static const char* const kFirewall[] = {"unsupported", "unknown", "open", "closed"};
++    state["firewall"] = kFirewall[static_cast<int>(firewall_)];
 +    auto& links = state["links"] = nlohmann::json::array();
 +    for (const auto& host : hosts_) {
-+      links.push_back(
-+          {{"host", host}, {"url", MakeLink(uuid_, host, options_.port)}});
++      links.push_back({{"host", host}, {"url", MakeLink(uuid_, host, port_)}});
 +    }
 +  }
 +  auto& servers = state["servers"] = nlohmann::json::array();
@@ -972,7 +1321,8 @@ index 0000000..8e782e8
 +  }
 +  state["active_index"] = active_index;
 +  state["pinned"] = pinned;
-+  state["failover"] = options_.failover.failover && servers.size() > 1;
++  state["failover_available"] = options_.failover.failover && servers.size() > 1;
++  state["failover"] = state["failover_available"];
 +  state["tunnel_down"] = active_index >= 0 && tunnels && tunnels->IsDown();
 +  auto events = RecentEvents();
 +  if (events.size() > 80) {
@@ -1001,10 +1351,10 @@ index 0000000..8e782e8
 +}  // namespace fptn::vless
 diff --git a/src/fptn-vless/app.h b/src/fptn-vless/app.h
 new file mode 100644
-index 0000000..11b86b9
+index 0000000..03d5024
 --- /dev/null
 +++ b/src/fptn-vless/app.h
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,153 @@
 +#pragma once
 +
 +/*
@@ -1045,6 +1395,8 @@ index 0000000..11b86b9
 +Uuid DeriveUuid(const std::string& token);       // same token -> same UUID
 +std::string MakeLink(const Uuid& uuid, const std::string& host, int port);
 +
++enum class FirewallStatus { kUnsupported, kUnknown, kOpen, kClosed };
++
 +struct AppOptions {
 +  FailoverController::Options failover;  // failover/scan_interval/timings
 +  std::string listen = "0.0.0.0";
@@ -1052,6 +1404,7 @@ index 0000000..11b86b9
 +  std::string uuid_override;   // empty: derived from the token
 +  std::string link_host;       // empty: detected
 +  std::string preferred_server;  // --server: connect to it (and keep it)
++  int reserved_port = 0;         // the control page's port: not allowed for VLESS
 +};
 +
 +struct AppDeps {
@@ -1063,6 +1416,10 @@ index 0000000..11b86b9
 +  std::function<bool()> carries_traffic;
 +  // Full check, returns a one-line summary. (optional)
 +  std::function<std::string()> full_check;
++  // Windows firewall (optional; without them the page hides that block).
++  std::function<FirewallStatus(int port)> firewall_status;
++  // Adds the allow rule (UAC prompt). Empty string = ok, else the reason.
++  std::function<std::string(int port)> firewall_add;
 +};
 +
 +class App {
@@ -1086,8 +1443,13 @@ index 0000000..11b86b9
 +  bool Disconnect();
 +  bool Rescan();
 +  bool CheckTunnel();
-+  bool Unpin();
++  bool Unpin();  // = SetMode("best")
 +  bool ForgetToken();
++  bool SetMode(const std::string& mode);  // "best" | "selected"
++  bool SetSwitchOnFailure(bool enabled);
++  bool SetPort(int port);
++  bool AddFirewallRule();
++  bool CheckFirewall();
 +
 +  std::string StateJson();
 +
@@ -1112,6 +1474,9 @@ index 0000000..11b86b9
 +  void OnIoc(const std::function<void()>& fn);
 +  bool StartVless();
 +  void SaveSettings();
++  void SetNotice(const std::string& text);
++  void RefreshFirewall();
++  std::string ServerName(std::size_t index);
 +
 +  boost::asio::io_context& ioc_;
 +  UserspaceStack& stack_;
@@ -1127,6 +1492,12 @@ index 0000000..11b86b9
 +  std::string token_;
 +  bool remember_ = false;
 +  bool token_saved_ = false;
++  std::string mode_ = "best";
++  bool switch_on_failure_ = true;
++  int port_ = 10800;
++  std::string selected_name_;  // the server the user chose last
++  std::string notice_;         // last problem to show on the page
++  FirewallStatus firewall_ = FirewallStatus::kUnsupported;
 +  Uuid uuid_{};
 +  std::vector<std::string> hosts_;
 +  std::shared_ptr<ITunnels> tunnels_;
@@ -1139,10 +1510,10 @@ index 0000000..11b86b9
 +}  // namespace fptn::vless
 diff --git a/src/fptn-vless/dashboard.cpp b/src/fptn-vless/dashboard.cpp
 new file mode 100644
-index 0000000..82c08af
+index 0000000..88c1774
 --- /dev/null
 +++ b/src/fptn-vless/dashboard.cpp
-@@ -0,0 +1,363 @@
+@@ -0,0 +1,497 @@
 +#include "fptn-vless/dashboard.h"
 +
 +#include <algorithm>
@@ -1160,124 +1531,258 @@ index 0000000..82c08af
 +
 +namespace {
 +
-+constexpr const char* kPage = R"HTML(<!doctype html>
++// The page is kept in several pieces: one string literal may not exceed
++// about 16 KB in MSVC.
++constexpr const char* kHead = R"HTML(<!doctype html>
 +<html lang="ru"><head><meta charset="utf-8">
 +<meta name="viewport" content="width=device-width,initial-scale=1">
 +<title>fptn-vless</title>
 +<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232f6fed'/%3E%3Ccircle cx='32' cy='32' r='23' fill='none' stroke='white' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='white' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='5' fill='white'/%3E%3C/svg%3E">
 +<style>
-+:root{--bg:#f6f7f9;--card:#fff;--fg:#1c2128;--mut:#667085;--line:#e4e7ec;--ac:#2f6fed;--ok:#1a9b52;--bad:#d92d20}
-+@media (prefers-color-scheme:dark){:root{--bg:#14171c;--card:#1c2128;--fg:#e6e9ee;--mut:#98a2b3;--line:#2d343e;--ac:#6c9bff;--ok:#3ccf7b;--bad:#ff6b5e}}
-+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,Segoe UI,sans-serif}
-+main{max-width:860px;margin:0 auto;padding:20px 16px 40px}
-+h1{font-size:20px;margin:0 0 4px}h2{font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:0 0 10px}
-+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-top:14px}
-+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:0}
-+.dot{width:10px;height:10px;border-radius:50%;background:var(--mut);display:inline-block}
-+.ok{background:var(--ok)}.bad{background:var(--bad)}.err{color:var(--bad)}
-+input,select,button,textarea{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:7px 10px}
-+button{cursor:pointer}button:hover{border-color:var(--ac)}button.p{background:var(--ac);border-color:var(--ac);color:#fff}
-+button:disabled{opacity:.5;cursor:default}[hidden]{display:none!important}
-+textarea{width:100%;font-family:ui-monospace,Consolas,monospace;font-size:12.5px;resize:vertical}
-+input.link{width:100%;font-family:ui-monospace,Consolas,monospace;font-size:13px}
-+table{width:100%;border-collapse:collapse}td,th{padding:7px 6px;border-top:1px solid var(--line);text-align:left}
-+th{border-top:0;color:var(--mut);font-weight:500;font-size:13px}td.n{text-align:right;font-variant-numeric:tabular-nums}
-+tr.act td{font-weight:600}.mut{color:var(--mut)}
-+pre{margin:0;max-height:240px;overflow:auto;font:12.5px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap}
-+</style></head><body><main>
-+<h1>fptn-vless</h1>
-+<div class="row mut"><span id="dot" class="dot"></span><span id="status">...</span></div>
-+
-+<div id="c_token" class="card" hidden><h2>Токен доступа FPTN</h2>
-+<textarea id="token" rows="4" placeholder="Вставьте токен целиком (fptnb:…). Пробелы и переносы строк не страшны." spellcheck="false"></textarea>
-+<div class="row" style="margin-top:8px"><label class="grow"><input type="checkbox" id="remember" checked> Запомнить на этом компьютере (хранится зашифрованным для вашей учётной записи Windows)</label>
-+<button id="send" class="p">Загрузить серверы</button></div>
-+<div id="token_msg" class="err" style="margin-top:8px"></div></div>
-+
-+<div id="c_link" class="card" hidden><h2>Ссылка для телефона / другого ПК</h2>
-+<div class="row"><select id="host"></select><button id="copy" class="p">Копировать</button></div>
-+<div style="margin-top:8px"><input id="link" class="link" readonly></div>
-+<div class="mut" style="margin-top:6px">Телефон и ПК должны быть в одной Wi-Fi сети. Если ссылка не импортируется, введите вручную: VLESS, адрес и порт из ссылки, UUID <span id="uuid"></span>, tcp, security none, encryption none.</div></div>
-+
-+<div id="c_servers" class="card" hidden><div class="row"><h2 class="grow" style="margin:0">Серверы</h2>
-+<button id="fast" class="p" hidden>Подключиться к самому быстрому</button>
-+<button id="disconnect" hidden>Отключиться</button>
-+<button id="rescan">Замерить заново</button><button id="check" hidden>Проверить туннель</button></div>
-+<div class="row" style="margin:6px 0"><span id="busy" class="mut grow"></span><button id="unpin" hidden>Выбирать сервер автоматически</button></div>
-+<div id="msg" class="err"></div>
-+<table><thead><tr><th>Сервер</th><th class="n">Отклик</th><th></th></tr></thead><tbody id="servers"></tbody></table>
-+<div id="check_result" class="mut" style="margin-top:8px"></div>
-+<div style="margin-top:10px"><button id="forget">Сменить токен</button></div></div>
-+
-+<div class="card"><h2>События</h2><pre id="events"></pre></div>
-+</main>
-+<script>
++)HTML";
++constexpr const char* kStyle = R"HTML(:root{--bg:#f3f5f8;--card:#fff;--fg:#17202b;--mut:#6b7686;--line:#e3e8ef;--soft:#f6f8fb;--ac:#2f6fed;--acfg:#fff;--acs:#e8efff;--ok:#16a05a;--warn:#d98a00;--bad:#d92d20;--shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06)}
++@media (prefers-color-scheme:dark){:root{--bg:#0f1318;--card:#171c23;--fg:#e8ecf1;--mut:#8e99a8;--line:#262d37;--soft:#1c222b;--ac:#6c9bff;--acfg:#0c1220;--acs:#1d2a44;--ok:#3ccf7b;--warn:#f0b13a;--bad:#ff7466;--shadow:none}}
++*{box-sizing:border-box}
++html,body{height:100%}
++body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 "Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,sans-serif;overflow:hidden;display:flex;flex-direction:column}
++button,input,select{font:inherit;color:inherit}
++button{cursor:pointer;border:1px solid var(--line);background:var(--card);border-radius:9px;padding:7px 12px;transition:border-color .15s,background .15s}
++button:hover:not(:disabled){border-color:var(--ac)}
++button:disabled{opacity:.5;cursor:default}
++button.p{background:var(--ac);border-color:var(--ac);color:var(--acfg);font-weight:600}
++button.p:hover:not(:disabled){filter:brightness(1.07)}
++button.ghost{background:transparent}
++button.sm{padding:4px 10px;font-size:13px}
++[hidden]{display:none!important}
++input,select{background:var(--card);border:1px solid var(--line);border-radius:9px;padding:7px 10px;min-width:0}
++input:focus,select:focus,button:focus-visible{outline:2px solid var(--ac);outline-offset:1px}
++.mut{color:var(--mut)}
++.top{display:flex;align-items:center;gap:14px;padding:12px 20px;background:var(--card);border-bottom:1px solid var(--line);box-shadow:var(--shadow)}
++.logo{width:34px;height:34px;flex:none}
++.top h1{font-size:16px;margin:0;line-height:1.1}
++.pill{display:inline-flex;align-items:center;gap:7px;font-size:13px;color:var(--mut);margin-top:2px}
++.dot{width:9px;height:9px;border-radius:50%;background:var(--mut);flex:none}
++.dot.ok{background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 25%,transparent)}
++.dot.bad{background:var(--bad)}.dot.work{background:var(--warn);animation:pulse 1s infinite}
++@keyframes pulse{50%{opacity:.35}}
++.spacer{flex:1}
++.banner{margin:12px 20px 0;padding:9px 14px;border-radius:10px;background:color-mix(in srgb,var(--bad) 12%,var(--card));border:1px solid color-mix(in srgb,var(--bad) 35%,var(--line));color:var(--bad)}
++.grid{flex:1;min-height:0;display:grid;grid-template-columns:minmax(300px,1fr) 400px;gap:16px;padding:16px 20px 18px}
++.panel,.card{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow)}
++.left{display:flex;flex-direction:column;min-height:0}
++.phead{display:flex;align-items:center;gap:10px;padding:14px 16px 10px;flex-wrap:wrap}
++.phead h2{font-size:15px;margin:0}.phead .count{color:var(--mut);font-weight:400;margin-left:4px}
++.list{flex:1;min-height:0;overflow:auto;padding:0 8px 8px}
++.row{display:grid;grid-template-columns:minmax(80px,1.2fr) minmax(70px,1fr) 78px 118px;align-items:center;gap:10px;padding:9px 10px;border-radius:10px;border:1px solid transparent;cursor:pointer}
++.row:hover{background:var(--soft)}
++.row.act{background:var(--acs);border-color:color-mix(in srgb,var(--ac) 45%,transparent)}
++.row.off{opacity:.55}
++.name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
++.name small{font-weight:400;color:var(--mut);margin-left:6px}
++.bar{height:6px;border-radius:3px;background:var(--line);overflow:hidden}.bar i{display:block;height:100%;border-radius:3px;background:var(--ok)}
++.bar i.mid{background:var(--warn)}.bar i.bad{background:var(--bad)}
++.ms{text-align:right;font-variant-numeric:tabular-nums}
++.act-cell{text-align:right}
++.tag{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:600;background:var(--ac);color:var(--acfg)}
++.row button{opacity:0;padding:4px 10px;font-size:13px}.row:hover button{opacity:1}
++.pfoot{padding:9px 16px 10px;border-top:1px solid var(--line);font-size:13px;color:var(--mut)}
++#check{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:20px}
++.pfoot pre{height:76px;margin:6px 0 0;overflow:auto;font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;background:var(--soft);border-radius:8px;padding:6px 10px}
++.right{display:flex;flex-direction:column;gap:12px;min-height:0;overflow:auto;padding-right:2px}
++.card{padding:14px 16px;flex:none}
++.card h3{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin:0 0 9px;font-weight:600}
++.card h3+.seg{margin-top:0}
++.seg{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;background:var(--soft);border:1px solid var(--line);border-radius:10px;padding:3px;gap:3px}
++.seg button{border:0;background:transparent;border-radius:7px;padding:6px 8px;font-size:13px}
++.seg button.on{background:var(--card);box-shadow:0 1px 2px rgba(16,24,40,.15);color:var(--ac);font-weight:600}
++.seg.mini{display:inline-grid}
++.hint{font-size:12.5px;color:var(--mut);margin:7px 0 12px}
++.gap{height:6px}
++.line{display:flex;gap:8px;align-items:center}
++.line input[type=number]{width:110px}.line .grow{flex:1}
++input.link{width:100%;font:12.5px ui-monospace,Consolas,monospace;margin-top:8px;text-overflow:ellipsis}
++.fw{margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:13px}
++.fw .s-ok{color:var(--ok)}.fw .s-closed{color:var(--warn)}
++.overlay{position:fixed;inset:0;background:color-mix(in srgb,var(--bg) 82%,transparent);backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;padding:20px;z-index:5}
++.dialog{width:min(560px,100%);background:var(--card);border:1px solid var(--line);border-radius:16px;padding:22px;box-shadow:0 20px 50px rgba(16,24,40,.25)}
++.dialog h2{margin:0 0 4px;font-size:18px}
++.dialog textarea{width:100%;height:120px;margin-top:12px;font:12.5px ui-monospace,Consolas,monospace;border:1px solid var(--line);border-radius:10px;padding:10px;background:var(--card);color:var(--fg);resize:none}
++.dialog .err{color:var(--bad);min-height:20px;margin-top:6px}
++.dialog label{display:flex;gap:8px;align-items:flex-start;margin-top:10px;color:var(--mut)}
++@media (max-width:900px){body{overflow:auto;height:auto}.grid{grid-template-columns:1fr;flex:none}.list{max-height:50vh}.right{overflow:visible}}
++@media (max-height:640px){.top{padding:8px 16px}.grid{padding:10px 16px;gap:12px}.card{padding:10px 14px}.hint{display:none}.pfoot pre{height:52px}}
++)HTML";
++constexpr const char* kBody = R"HTML(</style></head><body>
++<header class="top">
++  <svg class="logo" viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="14" fill="#2f6fed"/><circle cx="32" cy="32" r="23" fill="none" stroke="#fff" stroke-width="5"/><circle cx="32" cy="32" r="13" fill="none" stroke="#fff" stroke-width="4"/><circle cx="32" cy="32" r="5" fill="#fff"/></svg>
++  <div><h1>fptn-vless</h1><div class="pill"><span id="dot" class="dot"></span><span id="status">…</span></div></div>
++  <div class="spacer"></div>
++  <button id="forget" class="ghost sm" hidden>Сменить токен</button>
++  <button id="main" class="p">Подключиться</button>
++</header>
++<div id="banner" class="banner" hidden></div>
++<div class="grid">
++  <section class="panel left">
++    <div class="phead"><h2>Серверы<span id="count" class="count"></span></h2><div class="spacer"></div>
++      <div class="seg mini" id="sort"><button data-v="ping" class="on">По пингу</button><button data-v="list">По списку</button></div>
++      <button id="rescan" class="sm">↻ Замерить</button></div>
++    <div id="servers" class="list"></div>
++    <div class="pfoot"><div id="check"></div><pre id="events"></pre></div>
++  </section>
++  <aside class="right">
++    <section class="card">
++      <h3>Режим подключения</h3>
++      <div class="seg" id="mode"><button data-v="best">Лучший по пингу</button><button data-v="selected">Только выбранный</button></div>
++      <div id="mode_hint" class="hint"></div>
++      <h3>Если сервер перестал отвечать</h3>
++      <div class="seg" id="onfail"><button data-v="switch">Перейти на другой</button><button data-v="nothing">Ничего не делать</button></div>
++    </section>
++    <section class="card">
++      <h3>Ссылка для телефона и других ПК</h3>
++      <div id="link_empty" class="mut">Появится после подключения.</div>
++      <div id="link_box" hidden>
++        <div class="line"><select id="host" class="grow"></select><button id="copy" class="p">Копировать</button></div>
++        <input id="link" class="link" readonly>
++      </div>
++    </section>
++    <section class="card">
++      <h3>Порт и доступ из сети</h3>
++      <div class="line"><input id="port" type="number" min="1" max="65535" inputmode="numeric"><button id="apply">Применить</button><span id="port_msg" class="mut"></span></div>
++      <div id="fw" class="fw" hidden><span id="fw_text"></span><button id="fw_add" class="sm p" hidden>Открыть порт в брандмауэре</button><button id="fw_check" class="sm ghost" hidden>Проверить</button></div>
++    </section>
++  </aside>
++</div>
++<div id="overlay" class="overlay" hidden>
++  <div class="dialog">
++    <h2>Токен доступа FPTN</h2>
++    <div class="mut">Вставьте токен целиком. Пробелы и переносы строк не мешают.</div>
++    <textarea id="token" placeholder="fptnb:…" spellcheck="false"></textarea>
++    <label><input type="checkbox" id="remember" checked><span>Запомнить на этом компьютере (хранится зашифрованным для вашей учётной записи Windows)</span></label>
++    <div id="token_msg" class="err"></div>
++    <div class="line"><div class="spacer"></div><button id="send" class="p">Загрузить серверы</button></div>
++  </div>
++</div>
++)HTML";
++constexpr const char* kScript = R"HTML(<script>
 +const $=id=>document.getElementById(id);
-+let state=null;
++let S=null, sortBy='ping', lastSig='';
++try{sortBy=localStorage.getItem('sort')||'ping';}catch(e){}
 +async function post(path,body){
 +  try{await fetch(path,{method:'POST',headers:{'X-Requested-With':'fptn'},body:body||''});}catch(e){}
 +  refresh();
 +}
-+function ping(s){return !s.probed?'...':(s.ping===null?'нет ответа':s.ping+' мс');}
++function pingClass(ms){return ms<800?'':(ms<2000?'mid':'bad');}
++function working(){return !!S.busy||S.phase==='scanning'||S.phase==='connecting';}
++function setSeg(id,val,disabled){
++  document.querySelectorAll('#'+id+' button').forEach(b=>{b.classList.toggle('on',b.dataset.v===val);b.disabled=!!disabled;});
++}
 +function render(){
-+  const s=state; if(!s) return;
-+  const connected=s.phase==='connected', has=s.servers.length>0;
-+  const working=!!s.busy||s.phase==='scanning'||s.phase==='connecting';
-+  $('dot').className='dot '+(s.tunnel_down?'bad':(connected?'ok':''));
++  if(!S) return;
++  const conn=S.phase==='connected', has=S.servers.length>0, work=working();
++  // status
++  const dot=$('dot'); dot.className='dot'+(work?' work':(S.tunnel_down?' bad':(conn?' ok':'')));
 +  let st='Не подключено';
-+  if(s.phase==='no_token') st='Нужен токен';
-+  else if(working) st=s.busy||s.message||'Работаю...';
-+  else if(connected){
-+    st=(s.tunnel_down?'Связь с сервером потеряна: ':'Подключено: ')+(s.servers[s.active_index]?s.servers[s.active_index].name:'')
-+      +(s.pinned?' · выбран вручную (сменится сам только при обрыве)':(s.failover?' · автопереключение включено':''));
-+  } else if(s.phase==='ready') st='Выберите сервер';
++  if(S.phase==='no_token') st='Нужен токен';
++  else if(work) st=S.busy||S.message||'Работаю…';
++  else if(conn){const a=S.servers[S.active_index]; st=(S.tunnel_down?'Связь потеряна · ':'Подключено · ')+(a?a.name:'');}
++  else if(has) st='Не подключено';
 +  $('status').textContent=st;
-+
-+  $('c_token').hidden = s.phase!=='no_token';
-+  $('token_msg').textContent = s.phase==='no_token' ? (s.message||'') : '';
-+  $('send').disabled = working;
-+  $('c_link').hidden = !connected;
-+  $('c_servers').hidden = !has;
-+  $('fast').hidden = connected; $('disconnect').hidden = !connected; $('check').hidden = !connected;
-+  $('fast').disabled = working; $('disconnect').disabled = working; $('rescan').disabled = working; $('check').disabled = working;
-+  $('forget').disabled = working;
-+  $('busy').textContent = s.busy||''; $('unpin').hidden = !s.pinned;
-+  $('msg').textContent = s.phase==='ready' ? (s.message||'') : '';
-+
++  const b=$('main'); b.textContent=conn?'Отключиться':'Подключиться'; b.className=conn?'':'p'; b.disabled=work||!has;
++  $('forget').hidden=S.phase==='no_token'; $('forget').disabled=work;
++  const note=S.notice||(S.phase==='ready'?S.message:'');
++  $('banner').hidden=!note; $('banner').textContent=note||'';
++  $('overlay').hidden=S.phase!=='no_token'; $('token_msg').textContent=S.phase==='no_token'?(S.message||''):''; $('send').disabled=work;
++  // settings
++  setSeg('mode',S.mode,false);
++  const fo=S.failover_available;
++  setSeg('onfail',S.switch_on_failure?'switch':'nothing',!fo);
++  $('mode_hint').textContent=S.mode==='best'
++    ?'Программа держится самого быстрого сервера и сама переходит на лучший, когда он меняется.'
++    :'Программа остаётся на выбранном вами сервере'+(S.selected?(' ('+S.selected+')'):'')+' и не ищет более быстрый.';
++  // link
++  $('link_empty').hidden=conn; $('link_box').hidden=!conn;
 +  const sel=$('host');
-+  if(sel.options.length!==s.links.length){
-+    sel.innerHTML=''; s.links.forEach((l,i)=>{const o=document.createElement('option');o.value=i;o.textContent=l.host;sel.appendChild(o);});
-+  }
-+  const li=Math.min(+sel.value||0,s.links.length-1);
-+  $('link').value=s.links[li]?s.links[li].url:''; $('uuid').textContent=s.uuid;
-+
-+  const tb=$('servers'); tb.innerHTML='';
-+  s.servers.forEach((sv,i)=>{
-+    const tr=document.createElement('tr'); if(connected&&i===s.active_index) tr.className='act';
-+    tr.innerHTML='<td></td><td class="n"></td><td class="n"></td>';
-+    tr.children[0].textContent=sv.name+(connected&&i===s.active_index?'  ✓':'');
-+    tr.children[1].textContent=ping(sv);
-+    if(!(connected&&i===s.active_index)){const b=document.createElement('button');b.textContent='Подключиться';b.disabled=working;b.onclick=()=>post('/api/connect?i='+i);tr.children[2].appendChild(b);}
-+    tb.appendChild(tr);
++  if(sel.options.length!==S.links.length){sel.innerHTML='';S.links.forEach((l,i)=>{const o=document.createElement('option');o.value=i;o.textContent=l.host;sel.appendChild(o);});}
++  const li=Math.min(+sel.value||0,S.links.length-1); $('link').value=S.links[li]?S.links[li].url:'';
++  // port + firewall
++  const pi=$('port');
++  if(document.activeElement!==pi && pi.dataset.dirty!=='1') pi.value=S.port;
++  portCheck();
++  const fw=$('fw'); fw.hidden=S.firewall==='unsupported';
++  const t=$('fw_text');
++  t.className=''; 
++  if(S.firewall==='open'){t.textContent='✓ Порт открыт в брандмауэре Windows';t.className='s-ok';}
++  else if(S.firewall==='closed'){t.textContent='Порт закрыт для других устройств сети.';t.className='s-closed';}
++  else {t.textContent='Состояние брандмауэра неизвестно.';}
++  $('fw_add').hidden=S.firewall==='open'; $('fw_add').disabled=work;
++  $('fw_check').hidden=S.firewall==='open'&&false; $('fw_check').disabled=work;
++  // servers
++  $('count').textContent=has?(' · '+S.servers.length):'';
++  $('rescan').disabled=work||!has;
++  document.querySelectorAll('#sort button').forEach(x=>x.classList.toggle('on',x.dataset.v===sortBy));
++  renderServers(conn,work);
++  $('check').textContent=S.check||(conn?'':'Нажмите «Замерить», чтобы обновить отклик.');
++  const ev=$('events'),bottom=ev.scrollTop+ev.clientHeight>=ev.scrollHeight-20;
++  const text=S.events.join('\n'); if(ev.textContent!==text){ev.textContent=text; if(bottom) ev.scrollTop=ev.scrollHeight;}
++}
++function renderServers(conn,work){
++  let idx=S.servers.map((s,i)=>i);
++  if(sortBy==='ping') idx.sort((a,b)=>{const pa=S.servers[a].ping,pb=S.servers[b].ping;
++    if(pa===null&&pb===null) return a-b; if(pa===null) return 1; if(pb===null) return -1; return pa-pb||a-b;});
++  const best=Math.min(...S.servers.filter(s=>s.ping!==null).map(s=>s.ping));
++  const sig=JSON.stringify([idx,S.servers.map(s=>[s.ping,s.probed]),S.active_index,S.selected,S.mode,conn,work]);
++  if(sig===lastSig) return; lastSig=sig;
++  const box=$('servers'), keep=box.scrollTop; box.innerHTML='';
++  idx.forEach(i=>{
++    const s=S.servers[i], active=conn&&i===S.active_index, off=s.probed&&s.ping===null;
++    const r=document.createElement('div'); r.className='row'+(active?' act':'')+(off?' off':'');
++    const n=document.createElement('div'); n.className='name'; n.textContent=s.name;
++    if(S.mode==='selected'&&S.selected===s.name&&!active){const g=document.createElement('small');g.textContent='выбран';n.appendChild(g);}
++    const bar=document.createElement('div'); bar.className='bar';
++    if(s.ping!==null){const f=document.createElement('i'); f.className=pingClass(s.ping); f.style.width=Math.max(6,Math.round(100*best/Math.max(s.ping,best)))+'%'; bar.appendChild(f);}
++    const ms=document.createElement('div'); ms.className='ms'+(s.ping===null?' mut':''); ms.textContent=!s.probed?'…':(s.ping===null?'нет ответа':s.ping+' мс');
++    const cell=document.createElement('div'); cell.className='act-cell';
++    if(active){const tg=document.createElement('span');tg.className='tag';tg.textContent='подключён';cell.appendChild(tg);}
++    else if(!off){const bt=document.createElement('button');bt.textContent='Подключиться';bt.disabled=work;bt.onclick=ev=>{ev.stopPropagation();post('/api/connect?i='+i);};cell.appendChild(bt);}
++    r.append(n,bar,ms,cell);
++    if(!active&&!off&&!work) r.onclick=()=>post('/api/connect?i='+i);
++    box.appendChild(r);
 +  });
-+  $('check_result').textContent=s.check||'';
-+  const ev=$('events'), atBottom=ev.scrollTop+ev.clientHeight>=ev.scrollHeight-20;
-+  ev.textContent=s.events.join('\n'); if(atBottom) ev.scrollTop=ev.scrollHeight;
++  box.scrollTop=keep;
++}
++function portCheck(){
++  const v=$('port').value.trim(), n=+v, ok=/^\d{1,5}$/.test(v)&&n>=1&&n<=65535;
++  let msg='';
++  if(!ok) msg='1–65535'; else if(S&&n===S.reserved_port) msg='занят панелью';
++  $('port_msg').textContent=msg;
++  $('apply').disabled=!ok||!S||n===S.port||n===S.reserved_port||working();
 +}
 +async function refresh(){
-+  try{const r=await fetch('/api/state');state=await r.json();render();}
++  try{const r=await fetch('/api/state');S=await r.json();render();}
 +  catch(e){$('status').textContent='Программа не отвечает (закрыта?)';$('dot').className='dot bad';}
 +}
-+$('host').onchange=render;
-+$('send').onclick=()=>{const t=$('token').value; if(!t.trim()) return; post('/api/token?remember='+($('remember').checked?1:0),t); $('token').value='';};
-+$('fast').onclick=()=>post('/api/connect?auto=1');
-+$('disconnect').onclick=()=>post('/api/disconnect');
++document.querySelectorAll('#mode button').forEach(b=>b.onclick=()=>{S.mode=b.dataset.v;render();post('/api/mode?value='+b.dataset.v);});
++document.querySelectorAll('#onfail button').forEach(b=>b.onclick=()=>{S.switch_on_failure=b.dataset.v==='switch';render();post('/api/onfail?value='+b.dataset.v);});
++document.querySelectorAll('#sort button').forEach(b=>b.onclick=()=>{sortBy=b.dataset.v;try{localStorage.setItem('sort',sortBy);}catch(e){}lastSig='';render();});
++$('main').onclick=()=>{if(S.phase==='connected') post('/api/disconnect'); else post('/api/connect?auto=1');};
++$('rescan').onclick=()=>post('/api/rescan');
 +$('forget').onclick=()=>{if(confirm('Отключиться и удалить сохранённый токен?')) post('/api/forget');};
-+$('copy').onclick=async()=>{const t=$('link').value;try{await navigator.clipboard.writeText(t);}catch(e){$('link').select();document.execCommand('copy');}$('copy').textContent='Скопировано';setTimeout(()=>$('copy').textContent='Копировать',1200);};
-+$('unpin').onclick=()=>post('/api/unpin'); $('rescan').onclick=()=>post('/api/rescan'); $('check').onclick=()=>post('/api/check');
++$('send').onclick=()=>{const t=$('token').value; if(!t.trim()) return; post('/api/token?remember='+($('remember').checked?1:0),t); $('token').value='';};
++$('host').onchange=render;
++$('copy').onclick=async()=>{const t=$('link').value;try{await navigator.clipboard.writeText(t);}catch(e){$('link').select();document.execCommand('copy');}$('copy').textContent='Скопировано ✓';setTimeout(()=>$('copy').textContent='Копировать',1300);};
++$('port').oninput=()=>{$('port').dataset.dirty='1';portCheck();};
++$('port').onkeydown=e=>{if(e.key==='Enter'&&!$('apply').disabled) $('apply').click();};
++$('apply').onclick=()=>{post('/api/port?value='+$('port').value.trim());$('port').dataset.dirty='';};
++$('fw_add').onclick=()=>post('/api/firewall'); $('fw_check').onclick=()=>post('/api/firewall_check');
 +refresh(); setInterval(refresh,1500);
 +</script></body></html>
 +)HTML";
++
++const std::string& Page() {
++  static const std::string page =
++      std::string(kHead) + kStyle + kBody + kScript;
++  return page;
++}
 +
 +std::string Response(int code,
 +    const char* reason,
@@ -1382,7 +1887,7 @@ index 0000000..82c08af
 +
 +  if (method == "GET") {
 +    if (path == "/" || path == "/index.html") {
-+      return Response(200, "OK", "text/html; charset=utf-8", kPage);
++      return Response(200, "OK", "text/html; charset=utf-8", Page());
 +    }
 +    if (path == "/api/state") {
 +      return Response(200, "OK", "application/json; charset=utf-8",
@@ -1656,10 +2161,10 @@ index 0000000..48d54ab
 +}  // namespace fptn::vless
 diff --git a/src/fptn-vless/failover.cpp b/src/fptn-vless/failover.cpp
 new file mode 100644
-index 0000000..e06bbc6
+index 0000000..4748d63
 --- /dev/null
 +++ b/src/fptn-vless/failover.cpp
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,339 @@
 +#include "fptn-vless/failover.h"
 +
 +#include <algorithm>
@@ -1848,6 +2353,16 @@ index 0000000..e06bbc6
 +  return ok;
 +}
 +
++bool FailoverController::Rebalance() {
++  const std::lock_guard<std::mutex> op(op_mu_);
++  ApplyScan(hooks_.probe_all());
++  const Decision d = Decide(options_.policy, Snapshot(), Active(), false);
++  if (d.do_switch && d.reason == "the ping is high") {
++    return TrySwitch(d.target, "the fastest server was requested");
++  }
++  return false;
++}
++
 +void FailoverController::FailOver(const std::string& reason) {
 +  const std::lock_guard<std::mutex> op(op_mu_);
 +  ApplyScan(hooks_.probe_all());
@@ -1940,7 +2455,8 @@ index 0000000..e06bbc6
 +    }
 +
 +    // 1. The live tunnel lost its connection and did not come back by itself.
-+    if (down && gap_ok && now - *down_since >= options_.down_grace) {
++    if (down && gap_ok && switch_on_failure_ &&
++        now - *down_since >= options_.down_grace) {
 +      Notify("The connection to the server is lost, looking for another");
 +      FailOver("the connection is lost");
 +      down_since = Clock::now();  // give the new tunnel time to come up
@@ -1962,6 +2478,9 @@ index 0000000..e06bbc6
 +      bool allowed = d.do_switch && gap_ok;
 +      if (allowed && pinned_ && d.reason == "the ping is high") {
 +        allowed = false;  // the user chose this server
++      }
++      if (allowed && !switch_on_failure_ && d.reason != "the ping is high") {
++        allowed = false;  // the user asked to stay when the server is dead
 +      }
 +      if (allowed && d.reason == "the server does not answer" &&
 +          hooks_.active_works && hooks_.active_works()) {
@@ -1987,10 +2506,10 @@ index 0000000..e06bbc6
 +}  // namespace fptn::vless
 diff --git a/src/fptn-vless/failover.h b/src/fptn-vless/failover.h
 new file mode 100644
-index 0000000..7dcad45
+index 0000000..d8b34a5
 --- /dev/null
 +++ b/src/fptn-vless/failover.h
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,150 @@
 +#pragma once
 +
 +/*
@@ -2099,8 +2618,15 @@ index 0000000..7dcad45
 +  // The user picked a server: switch now. `pin` = stay on it even when
 +  // another one is faster; only a dead connection moves us away.
 +  bool SwitchTo(std::size_t index, bool pin);
++  // Re-measures and moves to a clearly better server if there is one (same
++  // hysteresis as the periodic scan). True if it switched.
++  bool Rebalance();
 +  void SetPinned(bool pinned) { pinned_ = pinned; }
 +  bool Pinned() const { return pinned_; }
++  // What to do when the current server stops working: move to another one
++  // (default) or stay and wait. Ping-based moves are controlled by pinning.
++  void SetSwitchOnFailure(bool enabled) { switch_on_failure_ = enabled; }
++  bool SwitchOnFailure() const { return switch_on_failure_; }
 +
 +  std::optional<std::size_t> Active() const;
 +  std::vector<ServerHealth> Snapshot() const;
@@ -2129,16 +2655,17 @@ index 0000000..7dcad45
 +  std::condition_variable wake_cv_;
 +  std::atomic<bool> stop_{false};
 +  std::atomic<bool> pinned_{false};
++  std::atomic<bool> switch_on_failure_{true};
 +  std::thread thread_;
 +};
 +
 +}  // namespace fptn::vless
 diff --git a/src/fptn-vless/fptn-vless.cpp b/src/fptn-vless/fptn-vless.cpp
 new file mode 100644
-index 0000000..c73a500
+index 0000000..d090ce2
 --- /dev/null
 +++ b/src/fptn-vless/fptn-vless.cpp
-@@ -0,0 +1,400 @@
+@@ -0,0 +1,414 @@
 +/*
 + * fptn-vless: connect to an FPTN server with an access token and expose the
 + * tunnel to the LAN as a plain VLESS inbound.
@@ -2453,6 +2980,7 @@ index 0000000..c73a500
 +    app_options.uuid_override = args.get<std::string>("--uuid");
 +    app_options.link_host = args.get<std::string>("--link-host");
 +    app_options.preferred_server = args.get<std::string>("--server");
++    app_options.reserved_port = dashboard_port;
 +
 +    fptn::vless::AppDeps deps;
 +    deps.make_tunnels = [&](const std::string& token)
@@ -2462,6 +2990,19 @@ index 0000000..c73a500
 +      return std::make_unique<fptn::vless::TunnelManager>(config, tunnel_options);
 +    };
 +    deps.lan_hosts = []() { return LanAddresses(); };
++    deps.firewall_status = [](int port) {
++      using fptn::vless::FirewallStatus;
++      using fptn::vless::platform::FirewallState;
++      switch (fptn::vless::platform::FirewallRuleState(port)) {
++        case FirewallState::kOpen: return FirewallStatus::kOpen;
++        case FirewallState::kClosed: return FirewallStatus::kClosed;
++        case FirewallState::kUnknown: return FirewallStatus::kUnknown;
++        default: return FirewallStatus::kUnsupported;
++      }
++    };
++    deps.firewall_add = [](int port) {
++      return fptn::vless::platform::AddFirewallRule(port);
++    };
 +    deps.carries_traffic = [&stack]() {
 +      return fptn::vless::TunnelCarriesTraffic(stack);
 +    };
@@ -2698,10 +3239,10 @@ index 0000000..5e90c9a
 +#define TCP_QUEUE_OOSEQ 1
 diff --git a/src/fptn-vless/platform.cpp b/src/fptn-vless/platform.cpp
 new file mode 100644
-index 0000000..0a55c55
+index 0000000..2beaa45
 --- /dev/null
 +++ b/src/fptn-vless/platform.cpp
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,378 @@
 +#include "fptn-vless/platform.h"
 +
 +#include <utility>
@@ -2828,6 +3369,72 @@ index 0000000..0a55c55
 +  if (HWND window = GetConsoleWindow()) {
 +    ShowWindow(window, SW_HIDE);
 +  }
++}
++
++
++namespace {
++
++std::wstring RuleName(int port) {
++  return L"fptn-vless TCP " + std::to_wstring(port);
++}
++
++}  // namespace
++
++FirewallState FirewallRuleState(int port) {
++  std::wstring command = L"netsh.exe advfirewall firewall show rule name=\"" +
++                         RuleName(port) + L"\"";
++  STARTUPINFOW startup{};
++  startup.cb = sizeof(startup);
++  PROCESS_INFORMATION process{};
++  if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
++          CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
++    return FirewallState::kUnknown;
++  }
++  FirewallState result = FirewallState::kUnknown;
++  if (WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0) {
++    DWORD code = 1;
++    GetExitCodeProcess(process.hProcess, &code);
++    result = code == 0 ? FirewallState::kOpen : FirewallState::kClosed;
++  }
++  CloseHandle(process.hThread);
++  CloseHandle(process.hProcess);
++  return result;
++}
++
++std::string AddFirewallRule(int port) {
++  if (port < 1 || port > 65535) {
++    return "Неверный порт";
++  }
++  const std::wstring parameters =
++      L"advfirewall firewall add rule name=\"" + RuleName(port) +
++      L"\" dir=in action=allow protocol=TCP localport=" +
++      std::to_wstring(port) + L" profile=any";
++  SHELLEXECUTEINFOW info{};
++  info.cbSize = sizeof(info);
++  info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NO_CONSOLE;
++  info.lpVerb = L"runas";  // UAC prompt
++  info.lpFile = L"netsh.exe";
++  info.lpParameters = parameters.c_str();
++  info.nShow = SW_HIDE;
++  if (!ShellExecuteExW(&info)) {
++    return GetLastError() == ERROR_CANCELLED
++               ? "Запрос прав администратора отклонён"
++               : "Не удалось запустить netsh";
++  }
++  std::string error;
++  if (info.hProcess != nullptr) {
++    if (WaitForSingleObject(info.hProcess, 60000) != WAIT_OBJECT_0) {
++      error = "netsh не завершился вовремя";
++    } else {
++      DWORD code = 1;
++      GetExitCodeProcess(info.hProcess, &code);
++      if (code != 0) {
++        error = "netsh вернул ошибку " + std::to_string(code);
++      }
++    }
++    CloseHandle(info.hProcess);
++  }
++  return error;
 +}
 +
 +struct Tray::Impl {
@@ -3001,6 +3608,8 @@ index 0000000..0a55c55
 +bool EnsureDesktopShortcut() { return false; }
 +bool OwnsConsole() { return false; }
 +void HideConsole() {}
++FirewallState FirewallRuleState(int) { return FirewallState::kUnsupported; }
++std::string AddFirewallRule(int) { return "Недоступно на этой системе"; }
 +
 +struct Tray::Impl {};
 +Tray::Tray(Callbacks, std::string) : impl_(std::make_unique<Impl>()) {}
@@ -3014,10 +3623,10 @@ index 0000000..0a55c55
 +#endif
 diff --git a/src/fptn-vless/platform.h b/src/fptn-vless/platform.h
 new file mode 100644
-index 0000000..0f45cb9
+index 0000000..2042456
 --- /dev/null
 +++ b/src/fptn-vless/platform.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,58 @@
 +#pragma once
 +
 +/*
@@ -3047,6 +3656,13 @@ index 0000000..0f45cb9
 +bool OwnsConsole();
 +void HideConsole();
 +
++// Windows firewall: lets phones and other PCs in the LAN reach the VLESS port.
++enum class FirewallState { kUnsupported, kUnknown, kOpen, kClosed };
++FirewallState FirewallRuleState(int port);
++// Adds an inbound TCP allow rule. Needs administrator rights, so Windows shows
++// its UAC prompt. Blocks until done. Empty string = success, else the reason.
++std::string AddFirewallRule(int port);
++
 +class Tray {
 + public:
 +  struct Callbacks {
@@ -3071,10 +3687,10 @@ index 0000000..0f45cb9
 +}  // namespace fptn::vless::platform
 diff --git a/src/fptn-vless/settings_store.cpp b/src/fptn-vless/settings_store.cpp
 new file mode 100644
-index 0000000..3021e69
+index 0000000..202bf66
 --- /dev/null
 +++ b/src/fptn-vless/settings_store.cpp
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,230 @@
 +#include "fptn-vless/settings_store.h"
 +
 +#include <cstdlib>
@@ -3243,8 +3859,19 @@ index 0000000..3021e69
 +    if (json.contains("server") && json["server"].is_string()) {
 +      settings.server = json["server"].get<std::string>();
 +    }
-+    if (json.contains("pinned") && json["pinned"].is_boolean()) {
-+      settings.pinned = json["pinned"].get<bool>();
++    if (json.contains("mode") && json["mode"].is_string()) {
++      const auto mode = json["mode"].get<std::string>();
++      settings.mode = mode == "selected" ? "selected" : "best";
++    } else if (json.contains("pinned") && json["pinned"].is_boolean()) {
++      settings.mode = json["pinned"].get<bool>() ? "selected" : "best";  // old file
++    }
++    if (json.contains("switch_on_failure") &&
++        json["switch_on_failure"].is_boolean()) {
++      settings.switch_on_failure = json["switch_on_failure"].get<bool>();
++    }
++    if (json.contains("port") && json["port"].is_number_integer()) {
++      const int port = json["port"].get<int>();
++      settings.port = (port >= 1 && port <= 65535) ? port : 0;
 +    }
 +  } catch (...) {  // corrupt file = start from scratch
 +    return Settings{};
@@ -3264,7 +3891,9 @@ index 0000000..3021e69
 +      json["token"] = Base64Encode(protected_token);
 +    }
 +    json["server"] = settings.server;
-+    json["pinned"] = settings.pinned;
++    json["mode"] = settings.mode;
++    json["switch_on_failure"] = settings.switch_on_failure;
++    json["port"] = settings.port;
 +    const std::string tmp = FilePath() + ".tmp";
 +    {
 +      std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
@@ -3294,10 +3923,10 @@ index 0000000..3021e69
 +}  // namespace fptn::vless
 diff --git a/src/fptn-vless/settings_store.h b/src/fptn-vless/settings_store.h
 new file mode 100644
-index 0000000..9134b31
+index 0000000..91ea676
 --- /dev/null
 +++ b/src/fptn-vless/settings_store.h
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,45 @@
 +#pragma once
 +
 +/*
@@ -3313,7 +3942,12 @@ index 0000000..9134b31
 +struct Settings {
 +  std::string token;   // empty = nothing saved
 +  std::string server;  // server name chosen last time, may be empty
-+  bool pinned = false;
++  // "best": the fastest server, re-checked all the time.
++  // "selected": only the server chosen by the user.
++  std::string mode = "best";
++  // What to do when the current server stops working.
++  bool switch_on_failure = true;
++  int port = 0;        // VLESS port chosen in the panel, 0 = default
 +};
 +
 +class SettingsStore {
@@ -3340,10 +3974,10 @@ index 0000000..9134b31
 +}  // namespace fptn::vless
 diff --git a/src/fptn-vless/test/app_test.cpp b/src/fptn-vless/test/app_test.cpp
 new file mode 100644
-index 0000000..043951e
+index 0000000..b1d5268
 --- /dev/null
 +++ b/src/fptn-vless/test/app_test.cpp
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,307 @@
 +// The application state machine with a fake set of servers: token entry,
 +// scanning, connecting, switching, disconnecting, remembering the token.
 +#include <atomic>
@@ -3485,8 +4119,9 @@ index 0000000..043951e
 +    CHECK(WaitPhase(app, "connected"), "still connected");
 +    s = State(app);
 +    CHECK(s["active_index"] == 3 && s["pinned"] == true, "Delta, pinned by the user");
-+    CHECK(store.Load().server == "Delta" && store.Load().pinned, "choice remembered");
-+    CHECK(app.HandlePost("unpin", "", "") == 202 && State(app)["pinned"] == false, "unpin");
++    CHECK(store.Load().server == "Delta" && store.Load().mode == "selected", "choice remembered");
++    CHECK(app.HandlePost("unpin", "", "") == 202 && State(app)["pinned"] == false, "back to the best-by-ping mode");
++    CHECK(WaitPhase(app, "connected"), "re-balancing finished");
 +
 +    std::puts("[6] busy");
 +    world.delay_ms = 400;
@@ -3567,6 +4202,79 @@ index 0000000..043951e
 +    CHECK(WaitPhase(app, "connected"), "connected");
 +    const auto s = State(app);
 +    CHECK(s["links"].size() == 2 && s["links"][0]["host"] == "192.168.0.10", "links for the LAN addresses, best first");
++  }
++
++  std::puts("[14] panel settings: mode, behaviour on failure, port, firewall");
++  {
++    const auto dir2 = std::filesystem::temp_directory_path() / "fptn_app_test2";
++    std::filesystem::remove_all(dir2);
++    SettingsStore store2(dir2.string());
++    auto opts = options;
++    opts.port = 18960;
++    opts.reserved_port = 18961;
++    AppDeps d = deps;
++    std::atomic<int> fw_adds{0};
++    std::atomic<bool> fw_open{false};
++    d.firewall_status = [&](int) { return fw_open ? FirewallStatus::kOpen : FirewallStatus::kClosed; };
++    d.firewall_add = [&](int port) -> std::string {
++      if (port == 18999) return "denied";
++      ++fw_adds;
++      fw_open = true;
++      return "";
++    };
++    {
++      App app(ioc, stack, store2, opts, d);
++      app.Start(std::string("fptnb:KKK"));
++      CHECK(WaitPhase(app, "connected"), "connected");
++      auto st = State(app);
++      CHECK(st["mode"] == "best" && st["switch_on_failure"] == true && st["port"] == 18960,
++          "defaults: best mode, switch on failure, given port");
++      CHECK(st["firewall"] == "closed", "firewall state reported");
++
++      CHECK(app.HandlePost("mode", "value=nonsense", "") == 400, "bad mode -> 400");
++      CHECK(app.HandlePost("mode", "value=selected", "") == 202 && State(app)["pinned"] == true,
++          "selected mode pins the current server");
++      CHECK(WaitPhase(app, "connected"), "idle");
++      CHECK(store2.Load().mode == "selected" && !store2.Load().server.empty(), "mode and server remembered");
++
++      CHECK(app.HandlePost("onfail", "value=nothing", "") == 202 &&
++                State(app)["switch_on_failure"] == false && !store2.Load().switch_on_failure,
++          "do nothing on failure, remembered");
++      CHECK(app.HandlePost("onfail", "value=x", "") == 400, "bad value -> 400");
++
++      CHECK(app.HandlePost("port", "value=abc", "") == 400, "non-numeric port -> 400");
++      CHECK(app.HandlePost("port", "value=0", "") == 400 && app.HandlePost("port", "value=70000", "") == 400,
++          "out of range -> 400");
++      CHECK(app.HandlePost("port", "value=18961", "") == 400, "the panel's own port is refused");
++      CHECK(app.HandlePost("port", "value=18962", "") == 202 && WaitPhase(app, "connected"), "port change runs");
++      CHECK(State(app)["port"] == 18962 && PortOpen(18962) && !PortOpen(18960), "new port listens, old one is closed");
++      CHECK(State(app)["links"][0]["url"].get<std::string>().find(":18962") != std::string::npos,
++          "links show the new port");
++      CHECK(store2.Load().port == 18962, "port remembered");
++
++      {
++        asio::io_context other;
++        asio::ip::tcp::acceptor taken(other, {asio::ip::make_address("127.0.0.1"), 18963});
++        CHECK(app.HandlePost("port", "value=18963", "") == 202 && WaitPhase(app, "connected"), "busy port tried");
++        st = State(app);
++        CHECK(st["port"] == 18962 && PortOpen(18962), "old port kept and still listening");
++        CHECK(st["notice"].get<std::string>().find("18963") != std::string::npos, "the problem is shown");
++      }
++
++      CHECK(app.HandlePost("firewall", "", "") == 202 && WaitPhase(app, "connected"), "firewall button");
++      CHECK(fw_adds == 1 && State(app)["firewall"] == "open", "rule added, state is open now");
++      CHECK(app.HandlePost("firewall_check", "", "") == 202, "firewall re-check");
++      CHECK(WaitPhase(app, "connected"), "idle");
++    }
++    {
++      App app(ioc, stack, store2, opts, d);  // restart: preferences come back
++      app.Start(std::nullopt);
++      CHECK(WaitPhase(app, "no_token"), "restarted (the token was not remembered)");
++      const auto st = State(app);
++      CHECK(st["mode"] == "selected" && st["switch_on_failure"] == false && st["port"] == 18962,
++          "mode, failure behaviour and port survive a restart");
++    }
++    std::filesystem::remove_all(dir2);
 +  }
 +
 +  std::filesystem::remove_all(dir);
@@ -3857,10 +4565,10 @@ index 0000000..f569f2d
 +}
 diff --git a/src/fptn-vless/test/failover_test.cpp b/src/fptn-vless/test/failover_test.cpp
 new file mode 100644
-index 0000000..e2fcd55
+index 0000000..d0f6f67
 --- /dev/null
 +++ b/src/fptn-vless/test/failover_test.cpp
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,420 @@
 +// Tests of the failover policy and controller with a fake "world": pings,
 +// connect results and tunnel health are scripted, no network, no FPTN server.
 +#include <atomic>
@@ -4240,6 +4948,42 @@ index 0000000..e2fcd55
 +    CHECK(c.SwitchTo(1, true) && c.Active() == 1 && c.Pinned(),
 +        "SwitchTo(): manual switch pins the choice");
 +    CHECK(!c.SwitchTo(9, true), "SwitchTo(): bad index is refused");
++  }
++
++  std::puts("[8] what to do when the server dies");
++  {
++    World w;
++    w.pings = {50, 60};
++    w.connectable = {true, true};
++    FailoverController c(Names(2), FastOptions(), MakeHooks(w));
++    c.Start(std::size_t{0});
++    c.SetSwitchOnFailure(false);
++    w.SetDown(true);
++    std::this_thread::sleep_for(700ms);
++    CHECK(c.Active() == 0 && w.Log().size() == 1, "'do nothing': stays on a dead server");
++    c.SetSwitchOnFailure(true);
++    CHECK(WaitFor([&] { return c.Active() == 1; }, 3000), "'switch': moves on once enabled");
++  }
++  {
++    World w;  // probes of the active server fail for good
++    w.pings = {std::nullopt, 50};
++    w.connectable = {true, true};
++    auto hooks = MakeHooks(w);
++    hooks.active_works = []() { return false; };
++    FailoverController c(Names(2), FastOptions(), hooks);
++    c.Start(std::size_t{0});
++    c.SetSwitchOnFailure(false);
++    std::this_thread::sleep_for(700ms);
++    CHECK(c.Active() == 0, "'do nothing': a silent server is not abandoned either");
++  }
++  {
++    World w;  // quality-based moves are NOT failures: 'best' mode still follows ping
++    w.pings = {600, 50};
++    w.connectable = {true, true};
++    FailoverController c(Names(2), FastOptions(), MakeHooks(w));
++    c.Start(std::size_t{0});
++    c.SetSwitchOnFailure(false);
++    CHECK(WaitFor([&] { return c.Active() == 1; }, 3000), "'do nothing' does not stop moving to a faster server");
 +  }
 +
 +  std::printf("\n%s\n", g_fail ? "FAILED" : "ALL PASSED");
